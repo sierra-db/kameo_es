@@ -16,12 +16,12 @@ bson = { version = "2.13.0", features = ["chrono-0_4", "uuid-1"], optional = tru
 # cbor4ii = { version = "0.3.3", features = ["serde1"] }
 chrono = { version = "0.4", features = ["serde"] }
 ciborium = "0.2.2"
-eventus = { git = "https://github.com/tqwewe/eventus", branch = "feat/transactions" }
+eventus = { git = "https://github.com/tqwewe/eventus" }
 futures = "0.3.30"
 im = "15.1.0"
-kameo = "0.13.0"
+kameo = { path = "../kameo" } # "0.13.0"
 mongodb = { version = "3.1.0", optional = true }
-polodb_core = { path = "../../PoloDB/PoloDB/src/polodb_core", optional = true } # "5.1.2"
+# polodb_core = { path = "../../PoloDB/PoloDB/src/polodb_core", optional = true } # "5.1.2"
 prost-types = "0.13.1"
 serde = { version = "1.0.197", features = ["derive"] }
 serde_json = "*"
@@ -40,9 +40,9 @@ mongodb = [
   "dep:bson",
   "dep:mongodb"
 ]
-polodb = [
-  "dep:polodb_core"
-]
+# polodb = [
+#   "dep:polodb_core"
+# ]
 postgres = [
   "dep:sqlx",
   "sqlx/postgres",

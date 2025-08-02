@@ -3,12 +3,11 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use futures::FutureExt;
 use kameo::{
     actor::ActorRef,
     error::{Infallible, SendError},
-    mailbox::unbounded::UnboundedMailbox,
     message::Message,
-    request::MessageSendSync,
     Actor,
 };
 
@@ -119,7 +118,7 @@ pub(crate) trait EntityTransaction: Send + 'static {
     fn reset_transaction(
         &self,
         tx_id: usize,
-    ) -> Result<(), SendError<ResetTransaction, anyhow::Error>>;
+    ) -> Result<(), SendError<ResetTransaction, Infallible>>;
     fn abort_transaction(
         &self,
         tx_id: usize,
@@ -128,7 +127,7 @@ pub(crate) trait EntityTransaction: Send + 'static {
 
 impl<A> EntityTransaction for ActorRef<A>
 where
-    A: Actor<Mailbox = UnboundedMailbox<A>>
+    A: Actor
         + Message<CommitTransaction, Reply = ()>
         + Message<ResetTransaction, Reply = anyhow::Result<()>>
         + Message<AbortTransaction, Reply = ()>,
@@ -137,20 +136,29 @@ where
         &self,
         tx_id: usize,
     ) -> Result<(), SendError<CommitTransaction, Infallible>> {
-        self.tell(CommitTransaction { tx_id }).send_sync()
+        self.tell(CommitTransaction { tx_id })
+            .send()
+            .now_or_never()
+            .unwrap()
     }
 
     fn reset_transaction(
         &self,
         tx_id: usize,
-    ) -> Result<(), SendError<ResetTransaction, anyhow::Error>> {
-        self.tell(ResetTransaction { tx_id }).send_sync()
+    ) -> Result<(), SendError<ResetTransaction, Infallible>> {
+        self.tell(ResetTransaction { tx_id })
+            .send()
+            .now_or_never()
+            .unwrap()
     }
 
     fn abort_transaction(
         &self,
         tx_id: usize,
     ) -> Result<(), SendError<AbortTransaction, Infallible>> {
-        self.tell(AbortTransaction { tx_id }).send_sync()
+        self.tell(AbortTransaction { tx_id })
+            .send()
+            .now_or_never()
+            .unwrap()
     }
 }

@@ -2,20 +2,18 @@ use std::{
     collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     fmt,
     marker::PhantomData,
-    ops,
+    ops::{self, ControlFlow},
     sync::Arc,
     time::Duration,
 };
 
-use futures::Future;
 use kameo::{
-    actor::{ActorID, ActorRef, WeakActorRef},
-    error::{ActorStopReason, BoxError, PanicError},
-    mailbox::{bounded::BoundedMailbox, unbounded::UnboundedMailbox},
+    actor::{ActorId, ActorRef, WeakActorRef},
+    error::{ActorStopReason, PanicError},
+    mailbox,
     message::{Context, Message},
     messages,
     reply::DelegatedReply,
-    request::{ForwardMessageSend, MessageSend},
     Actor,
 };
 use sqlx::{prelude::FromRow, PgPool, Postgres};
@@ -83,11 +81,10 @@ impl<E: 'static, H: Send + 'static> Coordinator<E, H> {
             correlations: HashMap::new(),
             global_flush_semaphore: Arc::new(Semaphore::new(concurrency)),
             flush_interval: 100,
-            global_offset_actor: kameo::spawn(GlobalOffsetActor::new(
-                pool,
-                checkpoints_table,
-                projection_id,
-            )),
+            global_offset_actor: GlobalOffsetActor::spawn_with_mailbox(
+                GlobalOffsetActor::new(pool, checkpoints_table, projection_id),
+                mailbox::unbounded(),
+            ),
         }
     }
 
@@ -136,16 +133,21 @@ where
 }
 
 impl<E: 'static, H: Send + 'static> Actor for Coordinator<E, H> {
-    type Mailbox = BoundedMailbox<Self>;
+    type Args = Self;
+    type Error = anyhow::Error;
+
+    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        Ok(args)
+    }
 
     async fn on_link_died(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
-        id: ActorID,
+        id: ActorId,
         _reason: ActorStopReason,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         self.correlations.retain(|_, worker| worker.id() != id);
-        Ok(None)
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -168,79 +170,78 @@ where
         >,
     >;
 
-    fn handle(
+    async fn handle(
         &mut self,
         HandleEvent(event): HandleEvent,
-        mut ctx: Context<'_, Self, Self::Reply>,
-    ) -> impl Future<Output = Self::Reply> + Send {
-        async move {
-            if event.metadata.correlation_id.is_nil() {
-                panic!("nil correlation id");
-            }
-
-            let permit = self
-                .global_flush_semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .unwrap();
-
-            let entry = self.correlations.entry(event.metadata.correlation_id);
-            let correlation_worker_ref;
-            match entry {
-                Entry::Vacant(vacancy) => {
-                    let worker_ref = kameo::actor::spawn_link(
-                        &ctx.actor_ref(),
-                        CorrelationWorker {
-                            correlation_id: event.metadata.correlation_id,
-                            pool: self.pool.clone(),
-                            checkpoints_table: self.checkpoints_table.clone(),
-                            projection_id: self.projection_id.clone(),
-                            handler: self.handler.clone(),
-                            last_handled_event: None,
-                            flush_interval: self.flush_interval,
-                            global_offset_actor: self.global_offset_actor.clone(),
-                            phantom: PhantomData,
-                        },
-                    )
-                    .await;
-
-                    correlation_worker_ref = vacancy.insert(worker_ref);
-                }
-                Entry::Occupied(occupied) => {
-                    correlation_worker_ref = occupied.into_mut();
-                }
-            }
-
-            self.global_offset_actor
-                .tell(StartProcessing {
-                    event_id: event.id,
-                    permit,
-                })
-                .send()
-                .await
-                .unwrap();
-
-            let (delegated_reply, reply_sender) = ctx.reply_sender();
-            match reply_sender {
-                Some(reply_sender) => {
-                    correlation_worker_ref
-                        .ask(HandleEvent(event))
-                        .forward(reply_sender)
-                        .await
-                        .unwrap();
-                }
-                None => {
-                    correlation_worker_ref
-                        .tell(HandleEvent(event))
-                        .send()
-                        .await
-                        .unwrap();
-                }
-            }
-
-            delegated_reply
+        ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        if event.metadata.correlation_id.is_nil() {
+            panic!("nil correlation id");
         }
+
+        let permit = self
+            .global_flush_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let entry = self.correlations.entry(event.metadata.correlation_id);
+        let correlation_worker_ref;
+        match entry {
+            Entry::Vacant(vacancy) => {
+                let worker_ref = CorrelationWorker::spawn_link_with_mailbox(
+                    ctx.actor_ref(),
+                    CorrelationWorker {
+                        correlation_id: event.metadata.correlation_id,
+                        pool: self.pool.clone(),
+                        checkpoints_table: self.checkpoints_table.clone(),
+                        projection_id: self.projection_id.clone(),
+                        handler: self.handler.clone(),
+                        last_handled_event: None,
+                        flush_interval: self.flush_interval,
+                        global_offset_actor: self.global_offset_actor.clone(),
+                        phantom: PhantomData,
+                    },
+                    mailbox::unbounded(),
+                )
+                .await;
+
+                correlation_worker_ref = vacancy.insert(worker_ref);
+            }
+            Entry::Occupied(occupied) => {
+                correlation_worker_ref = occupied.into_mut();
+            }
+        }
+
+        self.global_offset_actor
+            .tell(StartProcessing {
+                event_id: event.id,
+                permit,
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let (delegated_reply, reply_sender) = ctx.reply_sender();
+        match reply_sender {
+            Some(reply_sender) => {
+                correlation_worker_ref
+                    .ask(HandleEvent(event))
+                    .forward(reply_sender)
+                    .await
+                    .unwrap();
+            }
+            None => {
+                correlation_worker_ref
+                    .tell(HandleEvent(event))
+                    .send()
+                    .await
+                    .unwrap();
+            }
+        }
+
+        delegated_reply
     }
 }
 
@@ -281,7 +282,7 @@ impl<E, H> CorrelationWorker<E, H> {
         let res = self.handler.composite_handle(&mut tx, event).await;
         if res.is_err() {
             tx.tx.rollback().await?;
-            return res.map_err(|e| e.into());
+            return res;
         }
 
         let Transaction { mut tx, dirty } = tx;
@@ -354,9 +355,13 @@ impl<E, H> CorrelationWorker<E, H> {
 }
 
 impl<E: 'static, H: Send + 'static> Actor for CorrelationWorker<E, H> {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = Self;
+    type Error = anyhow::Error;
 
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(
+        mut state: Self::Args,
+        _actor_ref: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
         #[derive(FromRow)]
         struct CheckpointRow {
             last_event_id: i64,
@@ -367,25 +372,25 @@ impl<E: 'static, H: Send + 'static> Actor for CorrelationWorker<E, H> {
                 SELECT last_event_id FROM {}
                 WHERE projection_id = $1 AND correlation_id = $2
             ",
-            self.checkpoints_table
+            state.checkpoints_table
         ))
-        .bind(self.projection_id.as_ref())
-        .bind(self.correlation_id)
-        .fetch_optional(&self.pool)
+        .bind(state.projection_id.as_ref())
+        .bind(state.correlation_id)
+        .fetch_optional(&state.pool)
         .await?;
 
-        self.last_handled_event = checkpoint.map(|cp| cp.last_event_id as u64);
+        state.last_handled_event = checkpoint.map(|cp| cp.last_event_id as u64);
 
-        Ok(())
+        Ok(state)
     }
 
     async fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
-        error!("{err}");
-        Ok(None)
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
+        error!("CorrelationWorker panicked: {err}");
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -395,7 +400,7 @@ impl<E: 'static, H: Send + 'static> Message<GetGlobalOffset> for Coordinator<E, 
     async fn handle(
         &mut self,
         msg: GetGlobalOffset,
-        mut ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let (delegated_reply, reply_sender) = ctx.reply_sender();
         if let Some(reply_sender) = reply_sender {
@@ -424,32 +429,30 @@ where
         EventHandlerError<PostgresEventProcessorError, <H as EventHandler<Transaction>>::Error>,
     >;
 
-    fn handle(
+    async fn handle(
         &mut self,
         HandleEvent(event): HandleEvent,
-        _ctx: Context<'_, Self, Self::Reply>,
-    ) -> impl Future<Output = Self::Reply> + Send {
-        async move {
-            let event_id = event.id;
-            match self.handle_event(event).await {
-                Ok(()) => {
-                    // Notify the GlobalOffsetActor about the new event id.
-                    self.global_offset_actor
-                        .tell(FinishProcessing { event_id })
-                        .send()
-                        .await
-                        .map_err(|_| {
-                            EventHandlerError::Processor(PostgresEventProcessorError::Postgres(
-                                sqlx::Error::RowNotFound, // Replace with appropriate error
-                            ))
-                        })?;
+        _ctx: &mut Context<Self, Self::Reply>,
+    ) -> Self::Reply {
+        let event_id = event.id;
+        match self.handle_event(event).await {
+            Ok(()) => {
+                // Notify the GlobalOffsetActor about the new event id.
+                self.global_offset_actor
+                    .tell(FinishProcessing { event_id })
+                    .send()
+                    .await
+                    .map_err(|_| {
+                        EventHandlerError::Processor(PostgresEventProcessorError::Postgres(
+                            sqlx::Error::RowNotFound, // Replace with appropriate error
+                        ))
+                    })?;
 
-                    Ok(())
-                }
-                Err(err) => {
-                    self.global_offset_actor.kill();
-                    Err(err)
-                }
+                Ok(())
+            }
+            Err(err) => {
+                self.global_offset_actor.kill();
+                Err(err)
             }
         }
     }
@@ -467,31 +470,35 @@ struct GlobalOffsetActor {
 }
 
 impl Actor for GlobalOffsetActor {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = Self;
+    type Error = anyhow::Error;
 
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
+    async fn on_start(
+        mut state: Self::Args,
+        _actor_ref: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
         // Fetch the persisted global_offset
         let global_offset_row: Option<(i64,)> = sqlx::query_as(&format!(
             "SELECT last_event_id FROM {} WHERE projection_id = $1 AND correlation_id = $2",
-            self.checkpoints_table,
+            state.checkpoints_table,
         ))
-        .bind(self.projection_id.as_ref())
+        .bind(state.projection_id.as_ref())
         .bind(Uuid::nil())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&state.pool)
         .await?;
 
-        self.global_offset = global_offset_row.map(|(n,)| n as u64);
+        state.global_offset = global_offset_row.map(|(n,)| n as u64);
 
-        Ok(())
+        Ok(state)
     }
 
     async fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         error!("GlobalOffsetActor panicked: {}", err);
-        Ok(None)
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -561,33 +568,27 @@ impl Message<FinishProcessing> for GlobalOffsetActor {
     async fn handle(
         &mut self,
         msg: FinishProcessing,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.processed_event_ids.insert(msg.event_id);
 
         let old_global_offset = self.global_offset;
-        loop {
-            if let Some((front_event_id, _)) = self.processing_event_ids.front() {
-                if self.processed_event_ids.remove(&front_event_id) {
-                    self.global_offset = Some(*front_event_id);
-                    self.processing_event_ids.pop_front();
-                } else {
-                    break;
-                }
+        while let Some((front_event_id, _)) = self.processing_event_ids.front() {
+            if self.processed_event_ids.remove(front_event_id) {
+                self.global_offset = Some(*front_event_id);
+                self.processing_event_ids.pop_front();
             } else {
                 break;
             }
         }
 
-        if old_global_offset != self.global_offset {
-            if !self.persist_scheduled {
-                self.persist_scheduled = true;
-                let actor_ref = ctx.actor_ref();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    let _ = actor_ref.tell(PersistOffset).await;
-                });
-            }
+        if old_global_offset != self.global_offset && !self.persist_scheduled {
+            self.persist_scheduled = true;
+            let actor_ref = ctx.actor_ref().clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = actor_ref.tell(PersistOffset).await;
+            });
         }
 
         Ok(())

@@ -1,6 +1,6 @@
 use std::{
-    any, collections::HashMap, fmt, future::IntoFuture, marker::PhantomData, time::Instant,
-    vec::IntoIter,
+    any, collections::HashMap, fmt, future::IntoFuture, marker::PhantomData, ops::ControlFlow,
+    time::Instant, vec::IntoIter,
 };
 
 use anyhow::anyhow;
@@ -12,12 +12,10 @@ use eventus::{
 };
 use futures::{future::BoxFuture, FutureExt};
 use kameo::{
-    actor::{ActorID, ActorRef, WeakActorRef},
-    error::{ActorStopReason, BoxError, Infallible, PanicError, SendError},
-    mailbox::bounded::BoundedMailbox,
+    actor::{ActorId, ActorRef, WeakActorRef},
+    error::{ActorStopReason, Infallible, PanicError, SendError},
     message::{Context, Message},
     reply::DelegatedReply,
-    request::{ForwardMessageSend, MessageSend},
     Actor,
 };
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
@@ -45,7 +43,7 @@ impl CommandService {
         client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
     ) -> Self {
         let event_store = EventStore::new(client);
-        let actor_ref = kameo::spawn(CommandServiceActor {
+        let actor_ref = CommandServiceActor::spawn(CommandServiceActor {
             event_store: event_store.clone(),
             entities: HashMap::new(),
         });
@@ -129,21 +127,26 @@ impl CommandService {
 /// The command service routes commands to spawned entity actors per stream id.
 struct CommandServiceActor {
     event_store: EventStore,
-    entities: HashMap<StreamID, (ActorID, Box<dyn any::Any + Send + Sync + 'static>)>,
+    entities: HashMap<StreamID, (ActorId, Box<dyn any::Any + Send + Sync + 'static>)>,
 }
 
 impl Actor for CommandServiceActor {
-    type Mailbox = BoundedMailbox<Self>;
+    type Args = Self;
+    type Error = anyhow::Error;
 
     fn name() -> &'static str {
         "CommandServiceActor"
+    }
+
+    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        Ok(args)
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         error!("command service actor stopped: {reason:?}");
         Ok(())
     }
@@ -152,20 +155,20 @@ impl Actor for CommandServiceActor {
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         error!("command service actor errored: {err}");
-        Ok(None) // Restart
+        Ok(ControlFlow::Continue(())) // Restart
     }
 
     async fn on_link_died(
         &mut self,
-        _actor_ref: kameo::actor::WeakActorRef<Self>,
-        id: ActorID,
-        _reason: kameo::error::ActorStopReason,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
+        _actor_ref: WeakActorRef<Self>,
+        id: ActorId,
+        _reason: ActorStopReason,
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         self.entities
             .retain(|_, (existing_id, _)| *existing_id != id);
-        Ok(None)
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -521,7 +524,7 @@ impl CommandServiceActor {
                 .cloned()
                 .unwrap(),
             None => {
-                let entity_ref = kameo::actor::spawn_link(
+                let entity_ref = EntityActor::spawn_link(
                     &cmd_service_actor_ref,
                     EntityActor::new(E::default(), stream_id.clone(), self.event_store.clone()),
                 )
@@ -563,7 +566,7 @@ where
     async fn handle(
         &mut self,
         msg: ExecuteMsg<E, C>,
-        mut ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let stream_id = StreamID::new_from_parts(E::name(), &msg.id);
         let entity_ref = self
@@ -612,7 +615,7 @@ where
     async fn handle(
         &mut self,
         msg: BeginTransaction<E>,
-        mut ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let stream_id = StreamID::new_from_parts(E::name(), &msg.id);
         let entity_ref = self

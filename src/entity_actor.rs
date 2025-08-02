@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, fmt, time::Instant};
+use std::{collections::VecDeque, fmt, ops::ControlFlow, time::Instant};
 
 use chrono::{DateTime, Utc};
 use eventus::{CurrentVersion, ExpectedVersion};
@@ -6,8 +6,7 @@ use futures::StreamExt;
 use im::HashMap;
 use kameo::{
     actor::{ActorRef, WeakActorRef},
-    error::{ActorStopReason, BoxError, Infallible, PanicError, SendError},
-    mailbox::unbounded::UnboundedMailbox,
+    error::{ActorStopReason, Infallible, PanicError, SendError},
     message::{Context, DynMessage, Message},
     reply::{BoxReplySender, DelegatedReply},
     Actor,
@@ -283,13 +282,13 @@ impl<E: Entity + Apply + Clone> EntityActor<E> {
     fn buffer_begin_transaction(
         &mut self,
         mut msg: BeginTransaction,
-        mut ctx: Context<'_, Self, DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>>>,
+        ctx: &mut Context<Self, DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>>>,
     ) -> DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>> {
         let (delegated_reply, reply_sender) = ctx.reply_sender();
         msg.is_buffered = true;
         self.buffered_commands.push_back((
             Box::new(msg),
-            ctx.actor_ref(),
+            ctx.actor_ref().clone(),
             reply_sender.map(|tx| tx.boxed()),
         ));
         delegated_reply
@@ -298,11 +297,7 @@ impl<E: Entity + Apply + Clone> EntityActor<E> {
     fn buffer_command<C>(
         &mut self,
         mut exec: Execute<E::ID, C, E::Metadata>,
-        mut ctx: Context<
-            '_,
-            Self,
-            DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>,
-        >,
+        ctx: &mut Context<Self, DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>>,
     ) -> DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>
     where
         E: Command<C>,
@@ -314,7 +309,7 @@ impl<E: Entity + Apply + Clone> EntityActor<E> {
         exec.is_buffered = true;
         self.buffered_commands.push_back((
             Box::new(exec),
-            ctx.actor_ref(),
+            ctx.actor_ref().clone(),
             reply_sender.map(|tx| tx.boxed()),
         ));
         delegated_reply
@@ -325,31 +320,35 @@ impl<E> Actor for EntityActor<E>
 where
     E: Entity + Apply + Clone,
 {
-    type Mailbox = UnboundedMailbox<Self>;
+    type Args = Self;
+    type Error = anyhow::Error;
 
     fn name() -> &'static str {
         "EntityActor"
     }
 
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        self.resync_with_db().await?;
-        Ok(())
+    async fn on_start(
+        mut args: Self::Args,
+        _actor_ref: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
+        args.resync_with_db().await?;
+        Ok(args)
     }
 
     async fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         error!("entity actor panicked: {err}");
-        Ok(Some(ActorStopReason::Panicked(err)))
+        Ok(ControlFlow::Break(ActorStopReason::Panicked(err)))
     }
 
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         _reason: ActorStopReason,
-    ) -> Result<(), BoxError> {
+    ) -> Result<(), Self::Error> {
         error!("entity actor stopped");
         Ok(())
     }
@@ -380,7 +379,7 @@ where
     async fn handle(
         &mut self,
         mut exec: Execute<E::ID, C, E::Metadata>,
-        mut ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if !exec.is_buffered && self.is_processing_buffered_commands {
             return self.buffer_command(exec, ctx);
@@ -435,7 +434,7 @@ where
                             }
 
                             return ctx.reply(Ok(ExecuteResult::PendingTransaction {
-                                entity_actor_ref: ctx.actor_ref(),
+                                entity_actor_ref: ctx.actor_ref().clone(),
                                 events,
                                 expected_version: starting_version.as_expected_version(),
                                 correlation_id: exec.metadata.correlation_id,
@@ -493,12 +492,12 @@ where
     async fn handle(
         &mut self,
         _msg: ProcessNextBufferedCommand,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.is_processing_buffered_commands = true;
 
         if let Some((exec, actor_ref, tx)) = self.buffered_commands.pop_front() {
-            if let Some(err) = exec.handle_dyn(self, actor_ref, tx).await {
+            if let Err(err) = exec.handle_dyn(self, actor_ref, tx).await {
                 std::panic::resume_unwind(Box::new(err));
             }
         }
@@ -522,7 +521,7 @@ where
     async fn handle(
         &mut self,
         msg: BeginTransaction,
-        mut ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if !msg.is_buffered && self.is_processing_buffered_commands {
             // Message is no buffered and we are processing buffered commands, so we'll buffer this
@@ -541,7 +540,7 @@ where
             None => {
                 // We're not in a transaction, so we can begin a new one
                 self.transaction = Some((msg.tx_id, self.state.clone()));
-                ctx.reply(Ok(ctx.actor_ref()))
+                ctx.reply(Ok(ctx.actor_ref().clone()))
             }
         }
     }
@@ -557,7 +556,7 @@ where
     async fn handle(
         &mut self,
         msg: CommitTransaction,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if let Some((tx_id, state)) = self.transaction.take() {
             if tx_id == msg.tx_id {
@@ -585,7 +584,7 @@ where
     async fn handle(
         &mut self,
         msg: ResetTransaction,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         self.resync_with_db().await?;
         if let Some((tx_id, state)) = &mut self.transaction {
@@ -609,7 +608,7 @@ where
     async fn handle(
         &mut self,
         msg: AbortTransaction,
-        ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if self
             .transaction

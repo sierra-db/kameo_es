@@ -1,12 +1,10 @@
-use std::{collections::HashMap, fmt, marker::PhantomData, sync::Arc};
+use std::{collections::HashMap, fmt, marker::PhantomData, ops::ControlFlow, sync::Arc};
 
 use kameo::{
     actor::{ActorID, ActorRef, WeakActorRef},
-    error::{ActorStopReason, BoxError, PanicError},
-    mailbox::bounded::BoundedMailbox,
+    error::{ActorStopReason, PanicError},
     message::{Context, Message},
     reply::DelegatedReply,
-    request::{ForwardMessageSend, MessageSend},
     Actor,
 };
 use mongodb::{
@@ -87,16 +85,21 @@ where
 }
 
 impl<E: 'static, H: Send + 'static> Actor for Coordinator<E, H> {
-    type Mailbox = BoundedMailbox<Self>;
+    type Args = Self;
+    type Error = anyhow::Error;
+
+    async fn on_start(args: Self::Args, _actor_ref: ActorRef<Self>) -> Result<Self, Self::Error> {
+        Ok(args)
+    }
 
     async fn on_link_died(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         id: ActorID,
         _reason: ActorStopReason,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         self.correlations.retain(|_, worker| worker.id() != id);
-        Ok(None)
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -122,13 +125,13 @@ where
     async fn handle(
         &mut self,
         HandleEvent(event): HandleEvent,
-        mut ctx: Context<'_, Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let correlation_worker_ref = self
             .correlations
             .entry(event.metadata.correlation_id)
             .or_insert_with(|| {
-                let worker_ref = kameo::spawn(CorrelationWorker {
+                let worker_ref = CorrelationWorker::spawn(CorrelationWorker {
                     correlation_id: event.metadata.correlation_id,
                     client: self.client.clone(),
                     checkpoints_collection: self.checkpoints_collection.clone(),
@@ -180,25 +183,29 @@ struct CorrelationWorker<E, H> {
 }
 
 impl<E: 'static, H: Send + 'static> Actor for CorrelationWorker<E, H> {
-    type Mailbox = BoundedMailbox<Self>;
+    type Args = Self;
+    type Error = anyhow::Error;
 
-    async fn on_start(&mut self, _actor_ref: ActorRef<Self>) -> Result<(), BoxError> {
-        let checkpoint = self
+    async fn on_start(
+        mut state: Self::Args,
+        _actor_ref: ActorRef<Self>,
+    ) -> Result<Self, Self::Error> {
+        let checkpoint = state
             .checkpoints_collection
-            .find_one(doc! { "_id": bson::Uuid::from(self.correlation_id) })
+            .find_one(doc! { "_id": bson::Uuid::from(state.correlation_id) })
             .await?;
-        self.last_handled_event = checkpoint.map(|cp| cp.last_event_id);
+        state.last_handled_event = checkpoint.map(|cp| cp.last_event_id);
 
-        Ok(())
+        Ok(state)
     }
 
     async fn on_panic(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
         err: PanicError,
-    ) -> Result<Option<ActorStopReason>, BoxError> {
+    ) -> Result<ControlFlow<ActorStopReason>, Self::Error> {
         error!("{err}");
-        Ok(None)
+        Ok(ControlFlow::Continue(()))
     }
 }
 
@@ -219,7 +226,7 @@ where
     async fn handle(
         &mut self,
         HandleEvent(event): HandleEvent,
-        _ctx: Context<'_, Self, Self::Reply>,
+        _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         let _permit = self.semaphore.acquire().await.unwrap();
 
