@@ -2,7 +2,7 @@ mod stream_id;
 pub mod test_utils;
 
 pub use kameo_es_macros::EventType;
-pub use stream_id::StreamID;
+pub use stream_id::StreamId;
 
 use std::{fmt, ops, str::FromStr, time::Instant};
 
@@ -77,12 +77,7 @@ where
     E: Entity,
 {
     fn clone(&self) -> Self {
-        Context {
-            metadata: self.metadata,
-            last_causation: self.last_causation,
-            time: self.time,
-            executed_at: self.executed_at,
-        }
+        *self
     }
 }
 
@@ -105,9 +100,13 @@ where
 
 #[derive(Debug)]
 pub struct Event<E = GenericValue, M = GenericValue> {
-    pub id: u64,
-    pub stream_id: StreamID,
+    pub id: Uuid,
+    pub partition_key: Uuid,
+    pub partition_id: u16,
+    pub transaction_id: Uuid,
+    pub partition_sequence: u64,
     pub stream_version: u64,
+    pub stream_id: StreamId,
     pub name: String,
     pub data: E,
     pub metadata: Metadata<M>,
@@ -135,8 +134,12 @@ impl Event {
                 return Err((
                     Event {
                         id: self.id,
-                        stream_id: self.stream_id,
+                        partition_key: self.partition_key,
+                        partition_id: self.partition_id,
+                        transaction_id: self.transaction_id,
+                        partition_sequence: self.partition_sequence,
                         stream_version: self.stream_version,
+                        stream_id: self.stream_id,
                         name: self.name,
                         data: self.data,
                         metadata,
@@ -149,8 +152,12 @@ impl Event {
 
         Ok(Event {
             id: self.id,
-            stream_id: self.stream_id,
+            partition_key: self.partition_key,
+            partition_id: self.partition_id,
+            transaction_id: self.transaction_id,
+            partition_sequence: self.partition_sequence,
             stream_version: self.stream_version,
+            stream_id: self.stream_id,
             name: self.name,
             data,
             metadata,
@@ -176,7 +183,7 @@ pub struct Metadata<T> {
     pub causation: Option<CausationMetadata>,
     #[serde(rename = "cid")]
     pub correlation_id: Uuid,
-    pub data: T,
+    pub data: Option<T>,
 }
 
 impl<T> Metadata<T> {
@@ -184,7 +191,7 @@ impl<T> Metadata<T> {
         Metadata {
             causation: self.causation,
             correlation_id: self.correlation_id,
-            data,
+            data: Some(data),
         }
     }
 }
@@ -194,18 +201,18 @@ impl Metadata<GenericValue> {
     where
         U: DeserializeOwned + Default,
     {
-        let data = if matches!(self.data, GenericValue(Value::Null)) {
-            U::default()
-        } else {
-            match self.data.0.deserialized() {
-                Ok(data) => data,
+        let data = match &self.data {
+            Some(GenericValue(Value::Null)) => Some(U::default()),
+            Some(data) => match data.0.deserialized() {
+                Ok(data) => Some(data),
                 Err(err) => {
                     return Err(CastMetadataError {
                         err,
                         metadata: self,
-                    })
+                    });
                 }
-            }
+            },
+            None => None,
         };
         Ok(Metadata {
             causation: self.causation,
@@ -216,7 +223,7 @@ impl Metadata<GenericValue> {
 }
 
 impl<T> ops::Deref for Metadata<T> {
-    type Target = T;
+    type Target = Option<T>;
 
     fn deref(&self) -> &Self::Target {
         &self.data
@@ -232,9 +239,9 @@ impl<T> ops::DerefMut for Metadata<T> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CausationMetadata {
     #[serde(rename = "ceid")]
-    pub event_id: u64,
+    pub event_id: Uuid,
     #[serde(rename = "csid")]
-    pub stream_id: StreamID,
+    pub stream_id: StreamId,
     #[serde(rename = "csv")]
     pub stream_version: u64,
     #[serde(rename = "ccid")]

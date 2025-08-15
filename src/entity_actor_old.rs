@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     fmt, io,
     ops::{ControlFlow, Deref},
     time::Instant,
@@ -8,9 +9,9 @@ use chrono::{DateTime, Utc};
 use im::HashMap;
 use kameo::{
     actor::{ActorRef, WeakActorRef},
-    error::{ActorStopReason, PanicError, SendError},
-    message::{Context, Message},
-    reply::DelegatedReply,
+    error::{ActorStopReason, Infallible, PanicError, SendError},
+    message::{Context, DynMessage, Message},
+    reply::{BoxReplySender, DelegatedReply},
     Actor,
 };
 use kameo_es_core::EventType;
@@ -19,32 +20,29 @@ use sierradb_client::{
     AsyncTypedCommands, CurrentVersion, EMAppendEvent, ErrorCode, ExpectedVersion, SierraError,
 };
 use thiserror::Error;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, instrument};
 use uuid::Uuid;
 
 use crate::{
     command_service::{AppendedEvent, ExecuteResult},
-    error::{parse_stream_version_string, ExecuteError, ParsedStream},
+    error::ExecuteError,
     transaction::{AbortTransaction, BeginTransaction, CommitTransaction, ResetTransaction},
     Apply, CausationMetadata, Command, Entity, Metadata, StreamId,
 };
 
-pub struct EntityActor<E: Entity + Apply> {
+pub struct EntityActor<E: Entity + Apply + Clone> {
     conn: MultiplexedConnection,
     partition_key: Uuid,
     stream_id: StreamId,
     state: EntityActorState<E>,
+    transaction: Option<(usize, EntityActorState<E>)>,
     conflict_reties: usize,
-}
-
-#[derive(Actor)]
-pub struct EntityTransactionActor<E: Entity + Apply> {
-    conn: MultiplexedConnection,
-    partition_key: Uuid,
-    stream_id: StreamId,
-    original_state: EntityActorState<E>,
-    state: EntityActorState<E>,
-    committed: bool,
+    buffered_commands: VecDeque<(
+        Box<dyn DynMessage<EntityActor<E>>>,
+        ActorRef<Self>,
+        Option<BoxReplySender>,
+    )>,
+    is_processing_buffered_commands: bool,
 }
 
 #[derive(Clone)]
@@ -148,14 +146,12 @@ where
         ) {
             (true, true) => {
                 // Correlation ID exists, make sure they match
-                // TODO: Resolve
-                // if &self.correlation_id != &metadata.correlation_id {
-                //     return Err(ExecuteError::CorrelationIDMismatch {
-                //         entity: E::name(),
-                //         existing: self.correlation_id,
-                //         new: metadata.correlation_id,
-                //     });
-                // }
+                if &self.correlation_id != &metadata.correlation_id {
+                    return Err(ExecuteError::CorrelationIDMismatch {
+                        existing: self.correlation_id,
+                        new: metadata.correlation_id,
+                    });
+                }
             }
             (true, false) => {
                 // Correlation ID exists, use the existing one
@@ -175,65 +171,14 @@ where
 
         Ok(())
     }
-
-    async fn resync_with_db(
-        &mut self,
-        conn: &mut MultiplexedConnection,
-        stream_id: &StreamId,
-        partition_key: Uuid,
-    ) -> anyhow::Result<()> {
-        loop {
-            let original_version = self.version;
-            let from_version = match self.version {
-                CurrentVersion::Current(version) => version + 1,
-                CurrentVersion::Empty => 0,
-            };
-
-            let batch = conn
-                .escan_with_partition_key(&stream_id, partition_key, from_version, None, Some(100))
-                .await?;
-
-            for event in batch.events {
-                assert_eq!(
-                    match self.version {
-                        CurrentVersion::Current(version) => version + 1,
-                        CurrentVersion::Empty => 0,
-                    },
-                    event.stream_version,
-                    "expected stream version {} but got {} for stream {}",
-                    match self.version {
-                        CurrentVersion::Current(version) => version + 1,
-                        CurrentVersion::Empty => 0,
-                    },
-                    event.stream_version,
-                    event.stream_id,
-                );
-                let ent_event = ciborium::from_reader(event.payload.as_slice())?;
-                let metadata: Metadata<E::Metadata> =
-                    ciborium::from_reader(event.metadata.as_slice())?;
-                self.apply(ent_event, stream_id, event.stream_version, metadata);
-            }
-
-            if !batch.has_more {
-                break;
-            }
-
-            if self.version == original_version {
-                error!("existing resync loop to potential infinite loop");
-                break;
-            }
-        }
-
-        Ok(())
-    }
 }
 
-impl<E: Entity + Apply> EntityActor<E> {
+impl<E: Entity + Apply + Clone> EntityActor<E> {
     pub fn new(
-        conn: MultiplexedConnection,
+        entity: E,
         partition_key: Uuid,
         stream_id: StreamId,
-        entity: E,
+        conn: MultiplexedConnection,
     ) -> Self {
         EntityActor {
             conn,
@@ -245,14 +190,73 @@ impl<E: Entity + Apply> EntityActor<E> {
                 correlation_id: Uuid::nil(),
                 last_causations: HashMap::new(),
             },
+            transaction: None,
             conflict_reties: 5,
+            buffered_commands: VecDeque::new(),
+            is_processing_buffered_commands: false,
         }
     }
 
-    async fn resync_with_db(&mut self) -> anyhow::Result<()> {
-        self.state
-            .resync_with_db(&mut self.conn, &self.stream_id, self.partition_key)
-            .await
+    fn current_state(&mut self) -> &mut EntityActorState<E> {
+        self.transaction
+            .as_mut()
+            .map(|(_, entity)| entity)
+            .unwrap_or(&mut self.state)
+    }
+
+    async fn resync_with_db(&mut self) -> anyhow::Result<()>
+    where
+        E: Clone,
+    {
+        loop {
+            let original_version = self.state.version;
+            let from_version = match self.state.version {
+                CurrentVersion::Current(version) => version + 1,
+                CurrentVersion::Empty => 0,
+            };
+
+            let batch = self
+                .conn
+                .escan(&self.stream_id, from_version, None, Some(100))
+                .await?;
+
+            for event in batch.events {
+                assert_eq!(
+                    match self.state.version {
+                        CurrentVersion::Current(version) => version + 1,
+                        CurrentVersion::Empty => 0,
+                    },
+                    event.stream_version,
+                    "expected stream version {} but got {} for stream {}",
+                    match self.state.version {
+                        CurrentVersion::Current(version) => version + 1,
+                        CurrentVersion::Empty => 0,
+                    },
+                    event.stream_version,
+                    event.stream_id,
+                );
+                let ent_event = ciborium::from_reader(event.payload.as_slice())?;
+                let metadata: Metadata<E::Metadata> =
+                    ciborium::from_reader(event.metadata.as_slice())?;
+                self.state
+                    .apply(ent_event, &self.stream_id, event.stream_version, metadata);
+            }
+
+            if !batch.has_more {
+                break;
+            }
+
+            if self.state.version == original_version {
+                error!("existing resync loop to potential infinite loop");
+                break;
+            }
+        }
+
+        if let Some((_, tx_state)) = &mut self.transaction {
+            *tx_state = self.state.clone();
+        }
+
+        Ok(())
     }
 
     async fn append_events(
@@ -292,10 +296,26 @@ impl<E: Entity + Apply> EntityActor<E> {
                 )
             })
             .collect::<Result<Vec<_>, AppendEventsError<_, _>>>()?;
-
         let info = match self.conn.emappend(self.partition_key, &new_events).await {
             Ok(info) => info,
-            Err(err) => return Err(AppendEventsError::from_sierra_err(err, events, metadata)),
+            Err(err) => {
+                return match SierraError::from_redis_error(&err) {
+                    SierraError::Protocol {
+                        code: ErrorCode::WrongVer,
+                        message,
+                    } => {
+                        let (current, expected) = parse_sequence_error(&message).unwrap();
+                        Err(AppendEventsError::IncorrectExpectedVersion {
+                            stream_id: self.stream_id.clone(),
+                            current,
+                            expected,
+                            events,
+                            metadata,
+                        })
+                    }
+                    err => Err(AppendEventsError::Database(err)),
+                }
+            }
         };
 
         let starting_version = match self.state.version {
@@ -323,11 +343,47 @@ impl<E: Entity + Apply> EntityActor<E> {
 
         Ok(appended)
     }
+
+    fn buffer_begin_transaction(
+        &mut self,
+        mut msg: BeginTransaction,
+        ctx: &mut Context<Self, DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>>>,
+    ) -> DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>> {
+        let (delegated_reply, reply_sender) = ctx.reply_sender();
+        msg.is_buffered = true;
+        self.buffered_commands.push_back((
+            Box::new(msg),
+            ctx.actor_ref().clone(),
+            reply_sender.map(|tx| tx.boxed()),
+        ));
+        delegated_reply
+    }
+
+    fn buffer_command<C>(
+        &mut self,
+        mut exec: Execute<E::ID, C, E::Metadata>,
+        ctx: &mut Context<Self, DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>>,
+    ) -> DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>
+    where
+        E: Command<C>,
+        E::ID: fmt::Debug,
+        E::Metadata: fmt::Debug,
+        C: fmt::Debug + Clone + Send + 'static,
+    {
+        let (delegated_reply, reply_sender) = ctx.reply_sender();
+        exec.is_buffered = true;
+        self.buffered_commands.push_back((
+            Box::new(exec),
+            ctx.actor_ref().clone(),
+            reply_sender.map(|tx| tx.boxed()),
+        ));
+        delegated_reply
+    }
 }
 
 impl<E> Actor for EntityActor<E>
 where
-    E: Entity + Apply,
+    E: Entity + Apply + Clone,
 {
     type Args = Self;
     type Error = anyhow::Error;
@@ -356,9 +412,9 @@ where
     async fn on_stop(
         &mut self,
         _actor_ref: WeakActorRef<Self>,
-        reason: ActorStopReason,
+        _reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
-        error!("entity actor stopped: {reason}");
+        error!("entity actor stopped");
         Ok(())
     }
 }
@@ -372,41 +428,61 @@ pub struct Execute<I, C, M> {
     pub expected_version: ExpectedVersion,
     pub time: DateTime<Utc>,
     pub executed_at: Instant,
+    pub tx_id: Option<usize>,
+    pub is_buffered: bool,
 }
 
 impl<E, C> Message<Execute<E::ID, C, E::Metadata>> for EntityActor<E>
 where
-    E: Entity + Command<C> + Apply,
+    E: Entity + Command<C> + Apply + Clone,
     E::ID: fmt::Debug,
     E::Metadata: fmt::Debug,
     C: fmt::Debug + Clone + Send + 'static,
 {
-    type Reply = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
+    type Reply = DelegatedReply<Result<ExecuteResult<E>, ExecuteError<E::Error>>>;
 
-    #[instrument(name = "handle_execute", skip(self, _ctx))]
+    #[instrument(name = "handle_execute", skip(self, ctx))]
     async fn handle(
         &mut self,
         mut exec: Execute<E::ID, C, E::Metadata>,
-        _ctx: &mut Context<Self, Self::Reply>,
+        ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if exec.partition_key != self.partition_key {
-            return Err(ExecuteError::PartitionKeyMismatch {
-                entity: E::name(),
+            return ctx.reply(Err(ExecuteError::PartitionKeyMismatch {
                 existing: self.partition_key,
                 new: exec.partition_key,
-            });
+            }));
+        }
+
+        if !exec.is_buffered && self.is_processing_buffered_commands {
+            return self.buffer_command(exec, ctx);
+        }
+
+        match (&self.transaction, exec.tx_id) {
+            (None, None) => {} // No transaction, continue processing
+            (None, Some(_)) => {
+                panic!("command being executed without beginning a transaction");
+            }
+            (Some(_), None) => {
+                // Existing transaction, buffer
+                return self.buffer_command(exec, ctx);
+            }
+            (Some((existing_tx_id, _)), Some(new_tx_id)) => {
+                // Existing transaction, ensure its the same one otherwise buffer
+                if existing_tx_id != &new_tx_id {
+                    return self.buffer_command(exec, ctx);
+                }
+            }
         }
 
         let mut attempt = 0;
         loop {
-            if let Err(err) = self
-                .state
-                .hydrate_metadata_correlation_id::<E::Error>(&mut exec.metadata)
+            let state = self.current_state();
+            if let Err(err) = state.hydrate_metadata_correlation_id::<E::Error>(&mut exec.metadata)
             {
-                return Err(err);
+                return ctx.reply(Err(err));
             }
-
-            let res = self.state.execute(
+            let res = state.execute(
                 &exec.id,
                 exec.command.clone(),
                 &exec.metadata,
@@ -416,95 +492,94 @@ where
             );
             match res {
                 Ok(Some(events)) => {
-                    if events.is_empty() {
-                        return Ok(ExecuteResult::Executed(vec![]));
-                    }
+                    match &mut self.transaction {
+                        Some((_, state)) => {
+                            // Apply to temporary state
+                            let starting_version = state.version;
+                            let mut version = match state.version {
+                                CurrentVersion::Current(v) => v + 1,
+                                CurrentVersion::Empty => 0,
+                            };
 
-                    // Append to event store directly
-                    match self.append_events(events, exec.metadata, exec.time).await {
-                        Ok(appended) => return Ok(ExecuteResult::Executed(appended)),
-                        Err(AppendEventsError::IncorrectExpectedVersion {
-                            stream_id,
-                            current,
-                            expected,
-                            metadata,
-                            ..
-                        }) => {
-                            debug!(%stream_id, %current, %expected, "write conflict");
-                            if attempt == self.conflict_reties {
-                                return Err(ExecuteError::TooManyConflicts { stream_id });
+                            for event in events.clone() {
+                                state.apply(event, &self.stream_id, version, exec.metadata.clone());
+                                version += 1;
                             }
 
-                            attempt += 1;
-                            exec.metadata = metadata;
+                            return ctx.reply(Ok(ExecuteResult::PendingTransaction {
+                                entity_actor_ref: ctx.actor_ref().clone(),
+                                events,
+                                expected_version: starting_version.as_expected_version(),
+                                correlation_id: exec.metadata.correlation_id,
+                            }));
                         }
-                        Err(err) => return Err(err.into()),
+                        None => {
+                            if events.is_empty() {
+                                return ctx.reply(Ok(ExecuteResult::Executed(vec![])));
+                            }
+
+                            // Append to event store directly
+                            match self.append_events(events, exec.metadata, exec.time).await {
+                                Ok(appended) => {
+                                    return ctx.reply(Ok(ExecuteResult::Executed(appended)))
+                                }
+                                Err(AppendEventsError::IncorrectExpectedVersion {
+                                    stream_id,
+                                    current,
+                                    expected,
+                                    metadata,
+                                    ..
+                                }) => {
+                                    debug!(%stream_id, %current, %expected, "write conflict");
+                                    if attempt == self.conflict_reties {
+                                        return ctx.reply(Err(ExecuteError::TooManyConflicts {
+                                            stream_id,
+                                        }));
+                                    }
+
+                                    attempt += 1;
+                                    exec.metadata = metadata;
+                                }
+                                Err(err) => return ctx.reply(Err(err.into())),
+                            }
+                        }
                     }
                 }
-                Ok(None) => return Ok(ExecuteResult::Idempotent),
-                Err(err) => return Err(err),
+                Ok(None) => return ctx.reply(Ok(ExecuteResult::Idempotent)),
+                Err(err) => return ctx.reply(Err(err)),
             }
         }
     }
 }
 
-impl<E, C> Message<Execute<E::ID, C, E::Metadata>> for EntityTransactionActor<E>
-where
-    E: Entity + Command<C> + Apply,
-    E::ID: fmt::Debug,
-    E::Metadata: fmt::Debug,
-    C: fmt::Debug + Clone + Send + 'static,
-{
-    type Reply = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
+#[derive(Debug)]
+struct ProcessNextBufferedCommand;
 
-    #[instrument(name = "handle_execute", skip(self, ctx))]
+impl<E> Message<ProcessNextBufferedCommand> for EntityActor<E>
+where
+    E: Entity + Apply + Clone,
+{
+    type Reply = ();
+
+    #[instrument(name = "handle_process_next_buffered_command", skip(self, ctx))]
     async fn handle(
         &mut self,
-        mut exec: Execute<E::ID, C, E::Metadata>,
+        _msg: ProcessNextBufferedCommand,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        if exec.partition_key != self.partition_key {
-            return Err(ExecuteError::PartitionKeyMismatch {
-                entity: E::name(),
-                existing: self.partition_key,
-                new: exec.partition_key,
-            });
+        self.is_processing_buffered_commands = true;
+
+        if let Some((exec, actor_ref, tx)) = self.buffered_commands.pop_front() {
+            if let Err(err) = exec.handle_dyn(self, actor_ref, tx).await {
+                std::panic::resume_unwind(Box::new(err));
+            }
         }
 
-        self.state
-            .hydrate_metadata_correlation_id::<E::Error>(&mut exec.metadata)?;
-
-        let res = self.state.execute(
-            &exec.id,
-            exec.command.clone(),
-            &exec.metadata,
-            exec.expected_version,
-            exec.time,
-            exec.executed_at,
-        )?;
-        match res {
-            Some(events) => {
-                // Apply to temporary state
-                let starting_version = self.state.version;
-                let mut version = match self.state.version {
-                    CurrentVersion::Current(v) => v + 1,
-                    CurrentVersion::Empty => 0,
-                };
-
-                for event in events.clone() {
-                    self.state
-                        .apply(event, &self.stream_id, version, exec.metadata.clone());
-                    version += 1;
-                }
-
-                Ok(ExecuteResult::PendingTransaction {
-                    entity_actor_ref: ctx.actor_ref().clone(),
-                    events,
-                    expected_version: starting_version.as_expected_version(),
-                    correlation_id: exec.metadata.correlation_id,
-                })
-            }
-            None => Ok(ExecuteResult::Idempotent),
+        // If more commands are buffered, enqueue another processing message
+        if !self.buffered_commands.is_empty() {
+            let _ = ctx.actor_ref().tell(ProcessNextBufferedCommand);
+        } else {
+            self.is_processing_buffered_commands = false;
         }
     }
 }
@@ -513,50 +588,40 @@ impl<E> Message<BeginTransaction> for EntityActor<E>
 where
     E: Entity + Apply + Clone,
 {
-    type Reply = DelegatedReply<ActorRef<EntityTransactionActor<E>>>;
+    type Reply = DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>>;
 
-    #[instrument(name = "handle_begin_transaction", skip(self, ctx))]
+    #[instrument(name = "handle_prepare_transaction", skip(self, ctx))]
     async fn handle(
         &mut self,
         msg: BeginTransaction,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let prepared = EntityTransactionActor::prepare();
-        let delegated_reply = ctx.reply(prepared.actor_ref().clone());
-
-        let res = prepared
-            .run(EntityTransactionActor {
-                conn: self.conn.clone(),
-                partition_key: self.partition_key,
-                stream_id: self.stream_id.clone(),
-                original_state: self.state.clone(),
-                state: self.state.clone(),
-                committed: false,
-            })
-            .await;
-        match res {
-            Ok((tx, ActorStopReason::Normal)) => {
-                if tx.committed {
-                    self.state = tx.state;
-                } else {
-                    debug!("ignoring transaction due to it being uncommitted");
-                }
-            }
-            Ok((_, reason)) => {
-                warn!("ignoring transaction due to abnormal stop reason: {reason}");
-            }
-            Err(err) => {
-                warn!("ignoring transaction due to actor panicking: {err}");
-            }
+        if !msg.is_buffered && self.is_processing_buffered_commands {
+            // Message is no buffered and we are processing buffered commands, so we'll buffer this
+            return self.buffer_begin_transaction(msg, ctx);
         }
 
-        delegated_reply
+        match &self.transaction {
+            Some((existing_tx_id, _)) => {
+                if existing_tx_id == &msg.tx_id {
+                    panic!("attempted to begin the same transaction multiple times");
+                }
+
+                // We're already in a transaction, so we'll buffer this transaction begin request
+                self.buffer_begin_transaction(msg, ctx)
+            }
+            None => {
+                // We're not in a transaction, so we can begin a new one
+                self.transaction = Some((msg.tx_id, self.state.clone()));
+                ctx.reply(Ok(ctx.actor_ref().clone()))
+            }
+        }
     }
 }
 
-impl<E> Message<CommitTransaction> for EntityTransactionActor<E>
+impl<E> Message<CommitTransaction> for EntityActor<E>
 where
-    E: Entity + Apply,
+    E: Entity + Apply + Clone,
 {
     type Reply = ();
 
@@ -566,12 +631,23 @@ where
         msg: CommitTransaction,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.committed = true;
-        ctx.stop();
+        if let Some((tx_id, state)) = self.transaction.take() {
+            if tx_id == msg.tx_id {
+                self.state = state;
+            } else {
+                error!("tried to commit transaction with wrong txn id");
+                return;
+            }
+        }
+
+        // Start processing buffered commands incrementally
+        if !self.is_processing_buffered_commands && !self.buffered_commands.is_empty() {
+            let _ = ctx.actor_ref().tell(ProcessNextBufferedCommand);
+        }
     }
 }
 
-impl<E> Message<ResetTransaction> for EntityTransactionActor<E>
+impl<E> Message<ResetTransaction> for EntityActor<E>
 where
     E: Entity + Apply + Clone,
 {
@@ -583,18 +659,21 @@ where
         msg: ResetTransaction,
         _ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        self.state
-            .resync_with_db(&mut self.conn, &self.stream_id, self.partition_key)
-            .await?;
-        self.state = self.original_state.clone();
-
+        self.resync_with_db().await?;
+        if let Some((tx_id, state)) = &mut self.transaction {
+            if tx_id == &msg.tx_id {
+                *state = self.state.clone();
+            } else {
+                error!("tried to commit transaction with wrong txn id");
+            }
+        }
         Ok(())
     }
 }
 
-impl<E> Message<AbortTransaction> for EntityTransactionActor<E>
+impl<E> Message<AbortTransaction> for EntityActor<E>
 where
-    E: Entity + Apply,
+    E: Entity + Apply + Clone,
 {
     type Reply = ();
 
@@ -604,7 +683,19 @@ where
         msg: AbortTransaction,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        ctx.stop();
+        if self
+            .transaction
+            .as_ref()
+            .map(|(tx_id, _)| tx_id == &msg.tx_id)
+            .unwrap_or(false)
+        {
+            self.transaction = None;
+        }
+
+        // Start processing buffered commands incrementally
+        if !self.is_processing_buffered_commands && !self.buffered_commands.is_empty() {
+            let _ = ctx.actor_ref().tell(ProcessNextBufferedCommand);
+        }
     }
 }
 
@@ -614,7 +705,6 @@ pub enum AppendEventsError<E, M> {
     Database(SierraError),
     #[error("expected '{stream_id}' version {expected} but got {current}")]
     IncorrectExpectedVersion {
-        partition_key: Uuid,
         stream_id: StreamId,
         current: CurrentVersion,
         expected: ExpectedVersion,
@@ -625,33 +715,6 @@ pub enum AppendEventsError<E, M> {
     InvalidTimestamp,
     #[error(transparent)]
     SerializeEvent(#[from] ciborium::ser::Error<io::Error>),
-}
-
-impl<E, M> AppendEventsError<E, M> {
-    pub fn from_sierra_err(err: impl Into<SierraError>, events: E, metadata: M) -> Self {
-        match err.into() {
-            SierraError::Protocol {
-                code: ErrorCode::WrongVer,
-                message,
-            } => {
-                let ParsedStream {
-                    partition_key,
-                    stream_id,
-                    current,
-                    expected,
-                } = parse_stream_version_string(&message).unwrap();
-                AppendEventsError::IncorrectExpectedVersion {
-                    partition_key,
-                    stream_id,
-                    current,
-                    expected,
-                    events,
-                    metadata,
-                }
-            }
-            err => AppendEventsError::Database(err),
-        }
-    }
 }
 
 impl<E, Ev, M> From<AppendEventsError<Ev, M>> for ExecuteError<E> {
@@ -684,4 +747,32 @@ impl<M, E, Ev, Me> From<SendError<M, AppendEventsError<Ev, Me>>> for ExecuteErro
             SendError::Timeout(_) => unreachable!("no timeouts are used in the event store"),
         }
     }
+}
+
+fn parse_sequence_error(message: &str) -> Option<(CurrentVersion, ExpectedVersion)> {
+    // Find "current partition sequence is "
+    let current_start = message.find("current partition sequence is ")?;
+    let current_start = current_start + "current partition sequence is ".len();
+
+    // Find " but expected "
+    let but_expected_pos = message.find(" but expected ")?;
+    let current_str = &message[current_start..but_expected_pos];
+
+    // Parse current value
+    let current = match current_str {
+        "<empty>" => CurrentVersion::Empty,
+        s => CurrentVersion::Current(s.parse::<u64>().ok()?),
+    };
+
+    // Find expected value after " but expected "
+    let expected_start = but_expected_pos + " but expected ".len();
+    let expected_str = &message[expected_start..];
+    let expected = match expected_str {
+        "any" => ExpectedVersion::Any,
+        "exists" => ExpectedVersion::Exists,
+        "empty" => ExpectedVersion::Empty,
+        s => ExpectedVersion::Exact(s.parse::<u64>().ok()?),
+    };
+
+    Some((current, expected))
 }

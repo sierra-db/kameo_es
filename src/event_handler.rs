@@ -1,4 +1,4 @@
-pub mod file;
+// pub mod file;
 pub mod in_memory;
 #[cfg(feature = "mongodb")]
 pub mod mongodb;
@@ -6,30 +6,20 @@ pub mod mongodb;
 pub mod mongodb_bulk;
 #[cfg(feature = "mongodb")]
 pub mod mongodb_correlations;
-#[cfg(feature = "polodb")]
-pub mod polodb;
+// #[cfg(feature = "polodb")]
+// pub mod polodb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 
-use std::{marker::PhantomData, pin, task, vec::IntoIter};
+use std::{collections::HashMap, marker::PhantomData};
 
-use async_recursion::async_recursion;
-use eventus::server::{
-    eventstore::{
-        event_store_client::EventStoreClient, subscribe_request::StartFrom, EventBatch,
-        SubscribeRequest,
-    },
-    ClientAuthInterceptor,
-};
-use futures::{ready, Future, Stream, StreamExt, TryStreamExt};
+use futures::Future;
+use redis::RedisError;
+use sierradb_client::{EventSubscription, SierraError, SierraMessage, SubscriptionManager};
 use thiserror::Error;
-use tokio_util::sync::ReusableBoxFuture;
-use tonic::{
-    service::interceptor::InterceptedService, transport::Channel, Code, Status, Streaming,
-};
 use tracing::info;
 
-use crate::{event_from_eventus, Entity, Event};
+use crate::{event_from_sierra, Entity, Event, TryFromSierraEventError};
 
 pub trait EventProcessor<E, H>
 where
@@ -40,7 +30,7 @@ where
     type Error: Send;
 
     /// Which event to start streaming from.
-    fn start_from(&self) -> impl Future<Output = Result<u64, Self::Error>>;
+    fn start_from(&self) -> impl Future<Output = Result<HashMap<u16, u64>, Self::Error>>;
 
     /// Processes an event, which should internally call the event handler.
     fn process_event(
@@ -94,7 +84,7 @@ where
 /// A helper trait for creating an event handler stream.
 pub trait EventHandlerStreamBuilder: Sized + 'static {
     fn event_handler_stream<'a, P, H>(
-        client: &mut EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+        manager: &mut SubscriptionManager,
         processor: &'a mut P,
     ) -> impl Future<Output = Result<EventHandlerStream<Self>, EventHandlerError<P::Error, H::Error>>>
     where
@@ -104,14 +94,14 @@ pub trait EventHandlerStreamBuilder: Sized + 'static {
 
 impl<E: 'static> EventHandlerStreamBuilder for E {
     async fn event_handler_stream<'a, P, H>(
-        client: &mut EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+        manager: &mut SubscriptionManager,
         processor: &'a mut P,
     ) -> Result<EventHandlerStream<Self>, EventHandlerError<P::Error, H::Error>>
     where
         P: EventProcessor<Self, H> + 'static,
         H: EventHandler<P::Context> + 'static,
     {
-        EventHandlerStream::new(client, processor).await
+        EventHandlerStream::new(manager, processor).await
     }
 }
 
@@ -125,31 +115,33 @@ pub enum EventHandlerError<P, H> {
         err: ciborium::value::Error,
     },
     #[error(transparent)]
-    Grpc(#[from] Status),
+    Sierra(#[from] SierraError),
     #[error("failed to parse entity id: {0}")]
     ParseID(String),
     #[error("{0}")]
     Processor(P),
     #[error("{0}")]
     Handler(H),
+    #[error(transparent)]
+    EventFromSierra(#[from] TryFromSierraEventError),
+}
+
+impl<P, H> From<RedisError> for EventHandlerError<P, H> {
+    fn from(err: RedisError) -> Self {
+        EventHandlerError::Sierra(err.into())
+    }
 }
 
 /// A stream which processes events using an `EventProcessor`.
 pub struct EventHandlerStream<E> {
-    next_fut: ReusableBoxFuture<
-        'static,
-        (
-            Streaming<EventBatch>,
-            IntoIter<eventus::server::eventstore::Event>,
-            Option<Result<UnprocessedEvent<E>, Status>>,
-        ),
-    >,
+    subscription: EventSubscription,
+    events_since_ack: u64,
     phantom: PhantomData<fn() -> E>,
 }
 
 impl<E> EventHandlerStream<E> {
     async fn new<P, H>(
-        client: &mut EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
+        manager: &mut SubscriptionManager,
         processor: &mut P,
     ) -> Result<Self, EventHandlerError<P::Error, H::Error>>
     where
@@ -157,23 +149,17 @@ impl<E> EventHandlerStream<E> {
         P: EventProcessor<E, H>,
         H: EventHandler<P::Context>,
     {
-        let stream = client
-            .subscribe(SubscribeRequest {
-                start_from: Some(StartFrom::EventId(
-                    processor
-                        .start_from()
-                        .await
-                        .map_err(EventHandlerError::Processor)?,
-                )),
-            })
-            .await?
-            .into_inner();
+        let start_from = processor
+            .start_from()
+            .await
+            .map_err(EventHandlerError::Processor)?;
+        let subscription = manager
+            .subscribe_to_all_partitions_flexible(start_from, Some(0), Some(1_000))
+            .await?;
 
         Ok(EventHandlerStream {
-            next_fut: ReusableBoxFuture::new(event_handler_stream_next(
-                stream,
-                IntoIter::default(),
-            )),
+            subscription,
+            events_since_ack: 0,
             phantom: PhantomData,
         })
     }
@@ -187,10 +173,9 @@ impl<E> EventHandlerStream<E> {
         P: EventProcessor<E, H>,
         H: EventHandler<P::Context>,
     {
-        let event = self.next().await?;
-        match event {
+        match self.next().await? {
             Ok(event) => Some(event.process(processor).await),
-            Err(err) => Some(Err(EventHandlerError::Grpc(err))),
+            Err(err) => Some(Err(err.into())),
         }
     }
 
@@ -203,69 +188,37 @@ impl<E> EventHandlerStream<E> {
         P: EventProcessor<E, H>,
         H: EventHandler<P::Context>,
     {
-        while let Some(unprocessed_event) = self.try_next().await? {
+        while let Some(unprocessed_event) = self.next().await.transpose()? {
             unprocessed_event.process(processor).await?;
         }
         Ok(())
     }
-}
 
-impl<E> Stream for EventHandlerStream<E>
-where
-    E: 'static,
-{
-    type Item = Result<UnprocessedEvent<E>, Status>;
+    pub async fn next<P, H>(
+        &mut self,
+    ) -> Option<Result<UnprocessedEvent<E>, EventHandlerError<P, H>>> {
+        while let Some(event) = self.subscription.next_message().await {
+            match event {
+                SierraMessage::Event { event, cursor } => {
+                    self.events_since_ack += 1;
+                    if self.events_since_ack >= 800 {
+                        if let Err(err) = self.subscription.acknowledge_up_to_cursor(cursor).await {
+                            return Some(Err(err.into()));
+                        }
+                        self.events_since_ack = 0;
+                    }
 
-    fn poll_next(
-        self: pin::Pin<&mut Self>,
-        cx: &mut task::Context<'_>,
-    ) -> task::Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        let (stream, event_batch, res) = ready!(this.next_fut.poll(cx));
-        this.next_fut
-            .set(event_handler_stream_next(stream, event_batch));
-        cx.waker().wake_by_ref();
-
-        task::Poll::Ready(res)
-    }
-}
-
-#[async_recursion]
-async fn event_handler_stream_next<E>(
-    mut stream: Streaming<EventBatch>,
-    mut event_batch: IntoIter<eventus::server::eventstore::Event>,
-) -> (
-    Streaming<EventBatch>,
-    IntoIter<eventus::server::eventstore::Event>,
-    Option<Result<UnprocessedEvent<E>, Status>>,
-) {
-    match event_batch.next() {
-        Some(event) => match event_from_eventus(event) {
-            Ok(event) => (stream, event_batch, Some(Ok(UnprocessedEvent::new(event)))),
-            Err(_) => (
-                stream,
-                event_batch,
-                Some(Err(Status::new(Code::Internal, "invalid timestamp"))),
-            ),
-        },
-        None => match stream.next().await {
-            Some(Ok(EventBatch { events })) => {
-                let mut event_batch = events.into_iter();
-                match event_batch.next() {
-                    Some(event) => match event_from_eventus(event) {
-                        Ok(event) => (stream, event_batch, Some(Ok(UnprocessedEvent::new(event)))),
-                        Err(_) => (
-                            stream,
-                            event_batch,
-                            Some(Err(Status::new(Code::Internal, "invalid timestamp"))),
-                        ),
-                    },
-                    None => event_handler_stream_next(stream, event_batch).await,
+                    let event = match event_from_sierra(event) {
+                        Ok(event) => event,
+                        Err(err) => return Some(Err(err.into())),
+                    };
+                    return Some(Ok(UnprocessedEvent::new(event)));
                 }
+                SierraMessage::SubscriptionConfirmed { .. } => {}
             }
-            Some(Err(status)) => (stream, event_batch, Some(Err(status))),
-            None => (stream, event_batch, None),
-        },
+        }
+
+        None
     }
 }
 
@@ -293,7 +246,10 @@ impl<E> UnprocessedEvent<E> {
     {
         info!(
             "{} {:<32} {:>6} > {}",
-            self.event.id, self.event.stream_id, self.event.stream_version, self.event.name
+            self.event.partition_sequence,
+            self.event.stream_id,
+            self.event.stream_version,
+            self.event.name
         );
         processor.process_event(self.event).await
     }

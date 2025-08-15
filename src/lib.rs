@@ -2,84 +2,91 @@ pub mod command_service;
 pub mod entity_actor;
 pub mod error;
 pub mod event_handler;
-mod event_store;
+// mod event_store;
 pub mod transaction;
 
 use std::{convert::Infallible, io};
 
-use chrono::{DateTime, Utc};
-use eventus::server::eventstore::{
-    event_store_client::EventStoreClient, subscribe_request::StartFrom, EventBatch,
-    SubscribeRequest,
-};
-use futures::{stream::BoxStream, StreamExt, TryStreamExt};
 use kameo::error::SendError;
-use serde::de::DeserializeOwned;
+use sierradb_client::SierraError;
 use thiserror::Error;
-use tonic::{transport::Channel, Code, Status};
 
 pub use kameo_es_core::*;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum Error<M = (), E = Infallible> {
     #[error(transparent)]
-    Database(#[from] Status),
+    Database(#[from] SierraError),
     #[error(transparent)]
     SendError(#[from] SendError<M, E>),
 }
 
-pub async fn subscribe(
-    mut client: EventStoreClient<Channel>,
-    start_from: StartFrom,
-) -> Result<BoxStream<'static, Result<Vec<Event>, Status>>, Status> {
-    let stream = client
-        .subscribe(SubscribeRequest {
-            start_from: Some(start_from),
-        })
-        .await?
-        .into_inner();
+// pub async fn subscribe(
+//     mut client: MultiplexedConnection,
+//     start_from: Option<u64>,
+// ) -> Result<BoxStream<'static, Result<Vec<Event>, Status>>, Status> {
+//     client.epsub_by_key_from_sequence(partition_key, from_sequence)
 
-    Ok(stream
-        .and_then(|EventBatch { events }| async move {
-            events
-                .into_iter()
-                .map(|event| {
-                    event_from_eventus(event)
-                        .map_err(|err| Status::new(Code::Internal, err.to_string()))
-                })
-                .collect()
-        })
-        .boxed())
-}
+//     let stream = client
+//         .subscribe(SubscribeRequest {
+//             start_from: Some(start_from),
+//         })
+//         .await?
+//         .into_inner();
+
+//     Ok(stream
+//         .and_then(|EventBatch { events }| async move {
+//             events
+//                 .into_iter()
+//                 .map(|event| {
+//                     event_from_eventus(event)
+//                         .map_err(|err| Status::new(Code::Internal, err.to_string()))
+//                 })
+//                 .collect()
+//         })
+//         .boxed())
+// }
 
 #[derive(Debug, Error)]
-pub enum TryFromEventusEventError {
-    #[error("invalid timestamp")]
-    InvalidTimestamp,
+pub enum TryFromSierraEventError {
     #[error("failed to deserialize event data: {0}")]
     DeserializeEventData(ciborium::de::Error<io::Error>),
     #[error("failed to deserialize event metadata: {0}")]
     DeserializeEventMetadata(ciborium::de::Error<io::Error>),
 }
 
-fn event_from_eventus<E: DeserializeOwned, M: DeserializeOwned + Default>(
-    ev: eventus::server::eventstore::Event,
-) -> Result<Event<E, M>, TryFromEventusEventError> {
+// fn event_from_sierra<E: DeserializeOwned, M: DeserializeOwned + Default>(
+fn event_from_sierra(ev: sierradb_client::Event) -> Result<Event, TryFromSierraEventError> {
+    let data = if !ev.payload.is_empty() {
+        ciborium::from_reader(ev.payload.as_slice())
+            .map_err(TryFromSierraEventError::DeserializeEventData)?
+    } else {
+        GenericValue(ciborium::Value::Null)
+    };
+    let metadata = if !ev.metadata.is_empty() {
+        ciborium::from_reader(ev.metadata.as_slice())
+            .map_err(TryFromSierraEventError::DeserializeEventMetadata)?
+    } else {
+        Metadata {
+            causation: None,
+            correlation_id: Uuid::nil(),
+            data: None,
+        }
+    };
+
     Ok(Event {
-        id: ev.id,
-        stream_id: StreamID::new(ev.stream_id),
+        id: ev.event_id,
+        partition_key: ev.partition_key,
+        partition_id: ev.partition_id,
+        transaction_id: ev.transaction_id,
+        partition_sequence: ev.partition_sequence,
         stream_version: ev.stream_version,
+        stream_id: StreamId::new(ev.stream_id),
         name: ev.event_name,
-        data: ciborium::from_reader(ev.event_data.as_slice())
-            .map_err(TryFromEventusEventError::DeserializeEventData)?,
-        metadata: ciborium::from_reader(ev.metadata.as_slice())
-            .map_err(TryFromEventusEventError::DeserializeEventMetadata)?,
-        timestamp: ev
-            .timestamp
-            .and_then(|ts| {
-                DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos.try_into().unwrap_or(0))
-            })
-            .ok_or(TryFromEventusEventError::InvalidTimestamp)?,
+        data,
+        metadata,
+        timestamp: ev.timestamp.into(),
     })
 }
 

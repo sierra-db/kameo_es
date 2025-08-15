@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{self, SeekFrom},
     path::Path,
 };
@@ -20,7 +21,7 @@ pub struct FileEventProcessor<H> {
     file: File,
     handler: H,
     flush_interval: u64,
-    last_event_id: Option<u64>,
+    last_event_sequence: HashMap<u16, u64>,
     last_flush: Option<u64>,
 }
 
@@ -38,7 +39,7 @@ impl<H> FileEventProcessor<H> {
 
         let mut buf = Vec::new();
         file.read_to_end(&mut buf).await?;
-        let (handler, last_event_id) = if !buf.is_empty() {
+        let (handler, last_event_sequence) = if !buf.is_empty() {
             let last_event_id = u64::from_le_bytes(
                 buf[..8]
                     .try_into()
@@ -55,7 +56,7 @@ impl<H> FileEventProcessor<H> {
             file,
             handler,
             flush_interval: 20,
-            last_event_id,
+            last_event_sequence,
             last_flush: None,
         })
     }
@@ -77,7 +78,7 @@ impl<H> FileEventProcessor<H> {
     where
         H: Serialize,
     {
-        let Some(last_event_id) = self.last_event_id else {
+        let Some(last_event_id) = self.last_event_sequence else {
             return Ok(());
         };
         if Some(last_event_id) <= self.last_flush {
@@ -119,19 +120,19 @@ where
     type Context = ();
     type Error = FileEventProcessorError;
 
-    async fn start_from(&self) -> Result<u64, Self::Error> {
-        Ok(self.last_event_id.map(|n| n + 1).unwrap_or(0))
+    async fn start_from(&self) -> Result<HashMap<u16, u64>, Self::Error> {
+        Ok(self.last_event_sequence.map(|n| n + 1).unwrap_or(0))
     }
 
     async fn process_event(
         &mut self,
         event: Event,
     ) -> Result<(), EventHandlerError<Self::Error, <H as EventHandler<()>>::Error>> {
-        let event_id = event.id;
+        let sequence = event.partition_sequence;
 
         self.handler.composite_handle(&mut (), event).await?;
 
-        self.last_event_id = Some(event_id);
+        self.last_event_sequence = Some(sequence);
         self.flush().await.map_err(EventHandlerError::Processor)?;
 
         Ok(())

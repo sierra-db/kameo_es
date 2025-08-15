@@ -1,123 +1,123 @@
 use std::{
-    any, collections::HashMap, fmt, future::IntoFuture, marker::PhantomData, ops::ControlFlow,
+    any, collections::HashMap, fmt, future::IntoFuture, marker::PhantomData, mem, ops::ControlFlow,
     time::Instant, vec::IntoIter,
 };
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
-use ciborium::Value;
-use eventus::{
-    server::{eventstore::event_store_client::EventStoreClient, ClientAuthInterceptor},
-    ExpectedVersion,
-};
 use futures::{future::BoxFuture, FutureExt};
-use kameo::{
-    actor::{ActorId, ActorRef, WeakActorRef},
-    error::{ActorStopReason, Infallible, PanicError, SendError},
-    message::{Context, Message},
-    reply::DelegatedReply,
-    Actor,
+use kameo::prelude::*;
+use redis::aio::MultiplexedConnection;
+use sierradb_client::{
+    stream_partition_key, AsyncTypedCommands, EMAppendEvent, ErrorCode, ExpectedVersion,
+    SierraError,
 };
-use tonic::{service::interceptor::InterceptedService, transport::Channel};
 use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::{
-    entity_actor::{self, EntityActor},
-    error::ExecuteError,
-    event_store::{AppendEvents, AppendEventsError, EventStore},
+    entity_actor::{self, EntityActor, EntityTransactionActor},
+    error::{parse_stream_version_string, ExecuteError, ParsedStream},
     transaction::{self, Transaction, TransactionOutcome},
-    Apply, CausationMetadata, Command, Entity, Event, EventType, GenericValue, Metadata, StreamID,
+    Apply, CausationMetadata, Command, Entity, Event, EventType, Metadata, StreamId,
 };
 
 #[derive(Clone, Debug)]
 pub struct CommandService {
     actor_ref: ActorRef<CommandServiceActor>,
-    event_store: EventStore,
+    conn: MultiplexedConnection,
 }
 
 impl CommandService {
     /// Creates a new command service using an event store client connection and default worker count.
     #[inline]
-    pub fn new(
-        client: EventStoreClient<InterceptedService<Channel, ClientAuthInterceptor>>,
-    ) -> Self {
-        let event_store = EventStore::new(client);
+    pub fn new(conn: MultiplexedConnection) -> Self {
         let actor_ref = CommandServiceActor::spawn(CommandServiceActor {
-            event_store: event_store.clone(),
+            conn: conn.clone(),
             entities: HashMap::new(),
         });
 
-        CommandService {
-            actor_ref,
-            event_store,
-        }
+        CommandService { actor_ref, conn }
     }
 
     /// Returns a reference to the inner event store.
     #[inline]
-    pub fn event_store(&mut self) -> &mut EventStore {
-        &mut self.event_store
+    pub fn conn(&mut self) -> &mut MultiplexedConnection {
+        &mut self.conn
     }
 
     /// Starts a transaction.
     pub async fn transaction<C, A>(
         &mut self,
+        partition_key: Uuid,
         mut f: impl FnMut(Transaction<'_>) -> BoxFuture<'_, anyhow::Result<TransactionOutcome<C, A>>>,
     ) -> anyhow::Result<TransactionOutcome<C, A>> {
-        let id = Transaction::get_id();
         let mut entities = HashMap::new();
         let mut appends = Vec::new();
         let mut attempt = 0;
         loop {
-            let tx = Transaction::new(id, self, &mut entities, &mut appends);
+            let tx = Transaction::new(self, partition_key, &mut entities, &mut appends);
             let res = f(tx).await;
             match res {
                 Ok(TransactionOutcome::Commit(val)) => {
-                    let current_appends: Vec<_> = appends
-                        .drain(..)
-                        .filter(|append| !append.events.is_empty())
-                        .collect();
-                    if current_appends.is_empty() {
-                        Transaction::new(id, self, &mut entities, &mut appends).committed();
+                    if appends.is_empty() {
+                        Transaction::new(self, partition_key, &mut entities, &mut appends)
+                            .committed();
                         return Ok(TransactionOutcome::Commit(val));
                     }
 
+                    let current_appends = mem::take(&mut appends);
+
                     // Attempt the transaction
-                    let res = self.event_store.append_to_streams(current_appends).await;
-                    match res {
+                    match self.conn.emappend(partition_key, &current_appends).await {
                         Ok(_) => {
-                            Transaction::new(id, self, &mut entities, &mut appends).committed();
+                            Transaction::new(self, partition_key, &mut entities, &mut appends)
+                                .committed();
                             return Ok(TransactionOutcome::Commit(val));
                         }
-                        Err(AppendEventsError::IncorrectExpectedVersion {
-                            stream_id,
-                            current,
-                            expected,
-                            ..
-                        }) => {
-                            debug!(%stream_id, %current, %expected, "write conflict");
-                            if attempt >= 3 {
-                                Transaction::new(id, self, &mut entities, &mut appends).abort();
-                                return Err(anyhow!("too many conflict retries"));
-                            }
+                        Err(err) => match SierraError::from(err) {
+                            SierraError::Protocol {
+                                code: ErrorCode::WrongVer,
+                                message,
+                            } => {
+                                let ParsedStream {
+                                    partition_key,
+                                    stream_id,
+                                    current,
+                                    expected,
+                                } = parse_stream_version_string(&message).unwrap();
 
-                            attempt += 1;
-                            Transaction::new(id, self, &mut entities, &mut appends).reset();
-                        }
-                        Err(err) => {
-                            Transaction::new(id, self, &mut entities, &mut appends).abort();
-                            return Err(err.into());
-                        }
+                                debug!(%partition_key, %stream_id, %current, %expected, "write conflict");
+                                if attempt >= 3 {
+                                    Transaction::new(
+                                        self,
+                                        partition_key,
+                                        &mut entities,
+                                        &mut appends,
+                                    )
+                                    .abort();
+                                    return Err(anyhow!("too many conflict retries"));
+                                }
+
+                                attempt += 1;
+                                Transaction::new(self, partition_key, &mut entities, &mut appends)
+                                    .reset();
+                            }
+                            err => {
+                                Transaction::new(self, partition_key, &mut entities, &mut appends)
+                                    .abort();
+                                return Err(err.into());
+                            }
+                        },
                     }
                 }
                 Ok(TransactionOutcome::Abort(val)) => {
-                    Transaction::new(id, self, &mut entities, &mut appends).abort();
+                    Transaction::new(self, partition_key, &mut entities, &mut appends).abort();
                     return Ok(TransactionOutcome::Abort(val));
                 }
                 Err(err) => {
-                    Transaction::new(id, self, &mut entities, &mut appends).abort();
-                    return Err(err.into());
+                    Transaction::new(self, partition_key, &mut entities, &mut appends).abort();
+                    return Err(err);
                 }
             }
         }
@@ -126,8 +126,8 @@ impl CommandService {
 
 /// The command service routes commands to spawned entity actors per stream id.
 struct CommandServiceActor {
-    event_store: EventStore,
-    entities: HashMap<StreamID, (ActorId, Box<dyn any::Any + Send + Sync + 'static>)>,
+    conn: MultiplexedConnection,
+    entities: HashMap<StreamId, (ActorId, Box<dyn any::Any + Send + Sync + 'static>)>,
 }
 
 impl Actor for CommandServiceActor {
@@ -210,17 +210,17 @@ where
         id: E::ID,
         command: C,
     ) -> Execute<'a, E, C, &'a mut Transaction<'b>> {
-        Execute::new(&tx.cmd_service, id, command, tx)
+        Execute::new(tx.cmd_service, id, command, tx)
     }
 }
 
 #[derive(Debug)]
-pub enum ExecuteResult<E: Entity + Apply + Clone> {
+pub enum ExecuteResult<E: Entity + Apply> {
     /// The command was executed with the resulting events.
     Executed(Vec<AppendedEvent<E::Event>>),
     /// The command was executed and pending commit.
     PendingTransaction {
-        entity_actor_ref: ActorRef<EntityActor<E>>,
+        entity_actor_ref: ActorRef<EntityTransactionActor<E>>,
         events: Vec<E::Event>,
         expected_version: ExpectedVersion,
         correlation_id: Uuid,
@@ -229,13 +229,13 @@ pub enum ExecuteResult<E: Entity + Apply + Clone> {
     Idempotent,
 }
 
-pub enum ExecuteResultIter<E: Entity + Apply + Clone> {
+pub enum ExecuteResultIter<E: Entity + Apply> {
     Executed(IntoIter<AppendedEvent<E::Event>>),
     PendingTransaction(IntoIter<E::Event>),
     Idempotent,
 }
 
-impl<E: Entity + Apply + Clone> Iterator for ExecuteResultIter<E> {
+impl<E: Entity + Apply> Iterator for ExecuteResultIter<E> {
     type Item = E::Event;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -249,7 +249,7 @@ impl<E: Entity + Apply + Clone> Iterator for ExecuteResultIter<E> {
 
 impl<E> ExecuteResult<E>
 where
-    E: Entity + Apply + Clone,
+    E: Entity + Apply,
 {
     pub fn len(&self) -> usize {
         match self {
@@ -259,7 +259,23 @@ where
         }
     }
 
-    pub fn into_iter(self) -> ExecuteResultIter<E> {
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ExecuteResult::Executed(events) => events.is_empty(),
+            ExecuteResult::PendingTransaction { events, .. } => events.is_empty(),
+            ExecuteResult::Idempotent => true,
+        }
+    }
+}
+
+impl<E> IntoIterator for ExecuteResult<E>
+where
+    E: Entity + Apply,
+{
+    type Item = E::Event;
+    type IntoIter = ExecuteResultIter<E>;
+
+    fn into_iter(self) -> Self::IntoIter {
         match self {
             ExecuteResult::Executed(events) => ExecuteResultIter::Executed(events.into_iter()),
             ExecuteResult::PendingTransaction { events, .. } => {
@@ -273,7 +289,7 @@ where
 #[derive(Debug)]
 pub struct AppendedEvent<E> {
     pub event: E,
-    pub event_id: u64,
+    pub event_id: Uuid,
     pub stream_version: u64,
     pub timestamp: DateTime<Utc>,
 }
@@ -286,6 +302,7 @@ where
     cmd_service: &'a CommandService,
     id: E::ID,
     command: C,
+    partition_key: Option<Uuid>,
     metadata: Metadata<E::Metadata>,
     expected_version: ExpectedVersion,
     time: DateTime<Utc>,
@@ -303,6 +320,7 @@ where
             cmd_service,
             id,
             command,
+            partition_key: None,
             metadata: Metadata::default(),
             expected_version: ExpectedVersion::Any,
             time: Utc::now(),
@@ -310,6 +328,16 @@ where
             transaction: tx,
             phantom: PhantomData,
         }
+    }
+
+    pub fn partition_key(mut self, partition_key: Uuid) -> Self {
+        self.partition_key = Some(partition_key);
+        self
+    }
+
+    pub fn partition_key_from_stream_id(mut self, stream_id: &StreamId) -> Self {
+        self.partition_key = Some(stream_partition_key(stream_id));
+        self
     }
 
     pub fn caused_by(mut self, causation_metadata: CausationMetadata) -> Self {
@@ -364,11 +392,11 @@ where
                 .ask(ExecuteMsg {
                     id: self.id,
                     command: self.command,
+                    partition_key: self.partition_key,
                     metadata: self.metadata.clone(),
                     expected_version: self.expected_version,
                     time: self.time,
                     executed_at: self.executed_at,
-                    tx_id: None,
                     phantom: PhantomData::<E>,
                 })
                 .send()
@@ -401,15 +429,15 @@ where
 
     fn into_future(mut self) -> Self::IntoFuture {
         async move {
-            let stream_id = StreamID::new_from_parts(E::name(), &self.id);
-            if !self.transaction.is_registered(&stream_id) {
+            let stream_id = StreamId::new_from_parts(E::name(), &self.id);
+            let entity_actor_ref = if !self.transaction.is_registered(&stream_id) {
                 // Register this entity so it knows its in a transaction
                 let entity_actor_ref = self
                     .cmd_service
                     .actor_ref
                     .ask(BeginTransaction {
+                        partition_key: self.transaction.partition_key,
                         id: self.id.clone(),
-                        tx_id: self.transaction.id(),
                         phantom: PhantomData::<E>,
                     })
                     .send()
@@ -428,21 +456,24 @@ where
                         }
                     })?;
                 self.transaction
-                    .register_entity(stream_id.clone(), Box::new(entity_actor_ref));
+                    .register_entity(stream_id.clone(), Box::new(entity_actor_ref.clone()));
+                entity_actor_ref
+            } else {
+                self.transaction.lookup_entity(&stream_id).unwrap()
             };
 
-            let res = self
-                .cmd_service
-                .actor_ref
-                .ask(ExecuteMsg {
+            let partition_key = self.partition_key.unwrap_or_else(|| {
+                stream_partition_key(&StreamId::new_from_parts(E::name(), &self.id))
+            });
+            let res = entity_actor_ref
+                .ask(entity_actor::Execute {
                     id: self.id,
                     command: self.command,
+                    partition_key,
                     metadata: self.metadata.clone(),
                     expected_version: self.expected_version,
                     time: self.time,
                     executed_at: self.executed_at,
-                    tx_id: Some(self.transaction.id()),
-                    phantom: PhantomData::<E>,
                 })
                 .send()
                 .await
@@ -466,34 +497,32 @@ where
                     correlation_id,
                 } => {
                     self.metadata.correlation_id = correlation_id;
-                    let metadata =
-                        GenericValue(Value::serialized(&self.metadata).map_err(|err| {
-                            ExecuteError::SerializeMetadata(ciborium::ser::Error::Value(
-                                err.to_string(),
-                            ))
-                        })?);
+                    let mut metadata_buf = Vec::new();
+                    ciborium::into_writer(&self.metadata, &mut metadata_buf).map_err(|err| {
+                        ExecuteError::SerializeMetadata(ciborium::ser::Error::Value(
+                            err.to_string(),
+                        ))
+                    })?;
+                    // let metadata =
+                    //     GenericValue(Value::serialized(&self.metadata).map_err(|err| {
+                    //         ExecuteError::SerializeMetadata(ciborium::ser::Error::Value(
+                    //             err.to_string(),
+                    //         ))
+                    //     })?);
+                    //
 
-                    let generic_events = events
-                        .iter()
-                        .map(|event| {
-                            let event_type = event.event_type();
-                            let event = GenericValue(Value::serialized(event)?);
-                            Ok((event_type, event))
-                        })
-                        .collect::<anyhow::Result<_>>()
-                        .map_err(|err| {
-                            ExecuteError::SerializeMetadata(ciborium::ser::Error::Value(
-                                err.to_string(),
-                            ))
-                        })?;
-
-                    self.transaction.append(AppendEvents {
-                        stream_id,
-                        events: generic_events,
-                        expected_version,
-                        metadata,
-                        timestamp: self.time,
-                    });
+                    for event in &events {
+                        let mut payload = Vec::new();
+                        ciborium::into_writer(&event, &mut payload)
+                            .map_err(ExecuteError::SerializeEvent)?;
+                        self.transaction.append(
+                            EMAppendEvent::new(stream_id.to_string(), event.event_type())
+                                .payload(payload)
+                                .metadata(metadata_buf.clone())
+                                .expected_version(self.expected_version)
+                                .timestamp(self.time.into()),
+                        );
+                    }
 
                     Ok(ExecuteResult::PendingTransaction {
                         entity_actor_ref,
@@ -513,10 +542,11 @@ impl CommandServiceActor {
     async fn get_or_start_entity_actor<E>(
         &mut self,
         cmd_service_actor_ref: &ActorRef<Self>,
-        stream_id: StreamID,
+        partition_key: Uuid,
+        stream_id: StreamId,
     ) -> ActorRef<EntityActor<E>>
     where
-        E: Entity + Apply + Clone,
+        E: Entity + Apply,
     {
         match self.entities.get(&stream_id) {
             Some((_, actor_ref)) => actor_ref
@@ -525,8 +555,13 @@ impl CommandServiceActor {
                 .unwrap(),
             None => {
                 let entity_ref = EntityActor::spawn_link(
-                    &cmd_service_actor_ref,
-                    EntityActor::new(E::default(), stream_id.clone(), self.event_store.clone()),
+                    cmd_service_actor_ref,
+                    EntityActor::new(
+                        self.conn.clone(),
+                        partition_key,
+                        stream_id.clone(),
+                        E::default(),
+                    ),
                 )
                 .await;
 
@@ -546,11 +581,11 @@ where
 {
     id: E::ID,
     command: C,
+    partition_key: Option<Uuid>,
     metadata: Metadata<E::Metadata>,
     expected_version: ExpectedVersion,
     time: DateTime<Utc>,
     executed_at: Instant,
-    tx_id: Option<usize>,
     phantom: PhantomData<E>,
 }
 
@@ -568,21 +603,23 @@ where
         msg: ExecuteMsg<E, C>,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let stream_id = StreamID::new_from_parts(E::name(), &msg.id);
+        let stream_id = StreamId::new_from_parts(E::name(), &msg.id);
+        let partition_key = msg
+            .partition_key
+            .unwrap_or_else(|| stream_partition_key(&StreamId::new_from_parts(E::name(), &msg.id)));
         let entity_ref = self
-            .get_or_start_entity_actor::<E>(&ctx.actor_ref(), stream_id)
+            .get_or_start_entity_actor::<E>(ctx.actor_ref(), partition_key, stream_id)
             .await;
 
         let (delegated_reply, reply_sender) = ctx.reply_sender();
         let exec = entity_actor::Execute {
             id: msg.id,
             command: msg.command,
+            partition_key,
             expected_version: msg.expected_version,
             metadata: msg.metadata,
             time: msg.time,
             executed_at: msg.executed_at,
-            tx_id: msg.tx_id,
-            is_buffered: false,
         };
         match reply_sender {
             Some(tx) => {
@@ -601,8 +638,8 @@ struct BeginTransaction<E>
 where
     E: Entity,
 {
+    partition_key: Uuid,
     id: E::ID,
-    tx_id: usize,
     phantom: PhantomData<E>,
 }
 
@@ -610,29 +647,28 @@ impl<E> Message<BeginTransaction<E>> for CommandServiceActor
 where
     E: Entity + Apply + Clone,
 {
-    type Reply = DelegatedReply<Result<ActorRef<EntityActor<E>>, Infallible>>;
+    type Reply = DelegatedReply<ActorRef<EntityTransactionActor<E>>>;
 
     async fn handle(
         &mut self,
         msg: BeginTransaction<E>,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
-        let stream_id = StreamID::new_from_parts(E::name(), &msg.id);
+        let stream_id = StreamId::new_from_parts(E::name(), &msg.id);
         let entity_ref = self
-            .get_or_start_entity_actor::<E>(&ctx.actor_ref(), stream_id)
+            .get_or_start_entity_actor::<E>(ctx.actor_ref(), msg.partition_key, stream_id)
             .await;
 
         let (delegated_reply, reply_sender) = ctx.reply_sender();
-        let begin = transaction::BeginTransaction {
-            tx_id: msg.tx_id,
-            is_buffered: false,
-        };
         match reply_sender {
             Some(tx) => {
-                let _ = entity_ref.ask(begin).forward(tx).await;
+                let _ = entity_ref
+                    .ask(transaction::BeginTransaction)
+                    .forward(tx)
+                    .await;
             }
             None => {
-                let _ = entity_ref.tell(begin).send().await;
+                let _ = entity_ref.tell(transaction::BeginTransaction).send().await;
             }
         }
 

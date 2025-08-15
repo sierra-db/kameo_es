@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::{any, collections::HashMap};
 
 use futures::FutureExt;
 use kameo::{
@@ -10,8 +7,11 @@ use kameo::{
     message::Message,
     Actor,
 };
+use kameo_es_core::{Apply, Entity};
+use sierradb_client::EMAppendEvent;
+use uuid::Uuid;
 
-use crate::{command_service::CommandService, event_store::AppendEvents, GenericValue, StreamID};
+use crate::{command_service::CommandService, entity_actor::EntityTransactionActor, StreamId};
 
 pub enum TransactionOutcome<C = (), A = ()> {
     Commit(C),
@@ -19,59 +19,61 @@ pub enum TransactionOutcome<C = (), A = ()> {
 }
 
 pub struct Transaction<'a> {
-    id: usize,
     pub(crate) cmd_service: &'a CommandService,
-    entities: &'a mut HashMap<StreamID, Box<dyn EntityTransaction>>,
-    appends: &'a mut Vec<AppendEvents<(&'static str, GenericValue), GenericValue>>,
+    pub(crate) partition_key: Uuid,
+    entities: &'a mut HashMap<StreamId, Box<dyn EntityTransaction>>,
+    appends: &'a mut Vec<EMAppendEvent<'static>>,
 }
 
 impl<'a> Transaction<'a> {
     pub(crate) fn new(
-        id: usize,
         cmd_service: &'a CommandService,
-        entities: &'a mut HashMap<StreamID, Box<dyn EntityTransaction>>,
-        appends: &'a mut Vec<AppendEvents<(&'static str, GenericValue), GenericValue>>,
+        partition_key: Uuid,
+        entities: &'a mut HashMap<StreamId, Box<dyn EntityTransaction>>,
+        appends: &'a mut Vec<EMAppendEvent<'static>>,
     ) -> Self {
         Transaction {
-            id,
             cmd_service,
+            partition_key,
             entities,
             appends,
         }
     }
 
-    pub(crate) fn id(&self) -> usize {
-        self.id
-    }
-
-    pub(crate) fn is_registered(&mut self, stream_id: &StreamID) -> bool {
-        self.entities.contains_key(&stream_id)
+    pub(crate) fn is_registered(&mut self, stream_id: &StreamId) -> bool {
+        self.entities.contains_key(stream_id)
     }
 
     pub(crate) fn register_entity(
         &mut self,
-        stream_id: StreamID,
+        stream_id: StreamId,
         entity_actor_ref: Box<dyn EntityTransaction>,
     ) {
         self.entities.entry(stream_id).or_insert(entity_actor_ref);
     }
 
-    pub(crate) fn append(
-        &mut self,
-        append: AppendEvents<(&'static str, GenericValue), GenericValue>,
-    ) {
+    pub(crate) fn lookup_entity<E: Entity + Apply>(
+        &self,
+        stream_id: &str,
+    ) -> Option<ActorRef<EntityTransactionActor<E>>> {
+        self.entities
+            .get(stream_id)
+            .and_then(|ent| ent.as_any().downcast().map(|a| *a).ok())
+    }
+
+    pub(crate) fn append(&mut self, append: EMAppendEvent<'static>) {
         self.appends.push(append);
     }
 
     pub(crate) fn committed(self) {
         for (_, entity) in self.entities {
-            let _ = entity.commit_transaction(self.id);
+            let _ = entity.commit_transaction();
         }
     }
 
     pub(crate) fn reset(self) {
         for (_, entity) in &*self.entities {
-            let _ = entity.reset_transaction(self.id);
+            let _ = entity.reset_transaction();
         }
         // self.entities.clear();
         self.appends.clear();
@@ -79,50 +81,28 @@ impl<'a> Transaction<'a> {
 
     pub(crate) fn abort(self) {
         for (_, entity) in self.entities {
-            let _ = entity.abort_transaction(self.id);
+            let _ = entity.abort_transaction();
         }
     }
-
-    pub(crate) fn get_id() -> usize {
-        static COUNTER: AtomicUsize = AtomicUsize::new(1);
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    }
 }
 
 #[derive(Debug)]
-pub(crate) struct BeginTransaction {
-    pub(crate) tx_id: usize,
-    pub(crate) is_buffered: bool,
-}
+pub(crate) struct BeginTransaction;
 
 #[derive(Debug)]
-pub(crate) struct CommitTransaction {
-    pub(crate) tx_id: usize,
-}
+pub(crate) struct CommitTransaction;
 
 #[derive(Debug)]
-pub(crate) struct ResetTransaction {
-    pub(crate) tx_id: usize,
-}
+pub(crate) struct ResetTransaction;
 
 #[derive(Debug)]
-pub(crate) struct AbortTransaction {
-    pub(crate) tx_id: usize,
-}
+pub(crate) struct AbortTransaction;
 
 pub(crate) trait EntityTransaction: Send + 'static {
-    fn commit_transaction(
-        &self,
-        tx_id: usize,
-    ) -> Result<(), SendError<CommitTransaction, Infallible>>;
-    fn reset_transaction(
-        &self,
-        tx_id: usize,
-    ) -> Result<(), SendError<ResetTransaction, Infallible>>;
-    fn abort_transaction(
-        &self,
-        tx_id: usize,
-    ) -> Result<(), SendError<AbortTransaction, Infallible>>;
+    fn as_any(&self) -> Box<dyn any::Any>;
+    fn commit_transaction(&self) -> Result<(), SendError<CommitTransaction, Infallible>>;
+    fn reset_transaction(&self) -> Result<(), SendError<ResetTransaction, Infallible>>;
+    fn abort_transaction(&self) -> Result<(), SendError<AbortTransaction, Infallible>>;
 }
 
 impl<A> EntityTransaction for ActorRef<A>
@@ -132,33 +112,28 @@ where
         + Message<ResetTransaction, Reply = anyhow::Result<()>>
         + Message<AbortTransaction, Reply = ()>,
 {
-    fn commit_transaction(
-        &self,
-        tx_id: usize,
-    ) -> Result<(), SendError<CommitTransaction, Infallible>> {
-        self.tell(CommitTransaction { tx_id })
-            .send()
-            .now_or_never()
-            .unwrap()
+    fn as_any(&self) -> Box<dyn any::Any> {
+        Box::new(self.clone())
     }
 
-    fn reset_transaction(
-        &self,
-        tx_id: usize,
-    ) -> Result<(), SendError<ResetTransaction, Infallible>> {
-        self.tell(ResetTransaction { tx_id })
-            .send()
-            .now_or_never()
-            .unwrap()
+    fn commit_transaction(&self) -> Result<(), SendError<CommitTransaction, Infallible>> {
+        self.tell(CommitTransaction).send().now_or_never().unwrap()
     }
 
-    fn abort_transaction(
-        &self,
-        tx_id: usize,
-    ) -> Result<(), SendError<AbortTransaction, Infallible>> {
-        self.tell(AbortTransaction { tx_id })
-            .send()
-            .now_or_never()
-            .unwrap()
+    fn reset_transaction(&self) -> Result<(), SendError<ResetTransaction, Infallible>> {
+        self.tell(ResetTransaction).send().now_or_never().unwrap()
+    }
+
+    fn abort_transaction(&self) -> Result<(), SendError<AbortTransaction, Infallible>> {
+        self.tell(AbortTransaction).send().now_or_never().unwrap()
     }
 }
+
+// #[derive(Debug)]
+// pub struct AppendEvents<E, M> {
+//     pub stream_id: StreamId,
+//     pub events: Vec<E>,
+//     pub expected_version: ExpectedVersion,
+//     pub metadata: M,
+//     pub timestamp: DateTime<Utc>,
+// }

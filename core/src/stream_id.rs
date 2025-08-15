@@ -57,7 +57,7 @@
 //! not already in the in-memory cache.
 
 use std::{
-    fmt, ops,
+    borrow, fmt, ops,
     str::{self, Split},
 };
 
@@ -66,11 +66,11 @@ use serde::{Deserialize, Serialize};
 
 /// A stream name containing a category, and optionally an ID.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct StreamID {
+pub struct StreamId {
     inner: String,
 }
 
-impl StreamID {
+impl StreamId {
     /// Category type separator.
     ///
     /// When a stream category contains a category type, it is separated by a
@@ -113,12 +113,12 @@ impl StreamID {
 
     /// Creates a new StreamID.
     pub fn new(s: impl Into<String>) -> Self {
-        StreamID { inner: s.into() }
+        StreamId { inner: s.into() }
     }
 
     /// Creates a new StreamID from a category and id.
     pub fn new_from_parts(category: &str, id: impl fmt::Display) -> Self {
-        StreamID::new(format!("{category}{}{id}", Self::ID_SEPARATOR))
+        StreamId::new(format!("{category}{}{id}", Self::ID_SEPARATOR))
     }
 
     /// Returns the inner string.
@@ -196,11 +196,7 @@ impl StreamID {
 
     /// Pushes a type to the category if it doesn't already exist.
     pub fn push_type(&mut self, ty: &str) {
-        if self
-            .types()
-            .find(|existing_ty| *existing_ty == ty)
-            .is_some()
-        {
+        if self.types().any(|existing_ty| existing_ty == ty) {
             return;
         }
         let category = self.category();
@@ -215,67 +211,67 @@ impl StreamID {
     }
 }
 
-impl From<StreamID> for String {
-    fn from(stream_id: StreamID) -> Self {
+impl From<StreamId> for String {
+    fn from(stream_id: StreamId) -> Self {
         stream_id.into_inner()
     }
 }
 
-impl fmt::Display for StreamID {
+impl fmt::Display for StreamId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.inner.fmt(f)
     }
 }
 
-impl PartialEq<String> for StreamID {
+impl PartialEq<String> for StreamId {
     fn eq(&self, other: &String) -> bool {
         self.inner.eq(other)
     }
 }
 
-impl PartialEq<str> for StreamID {
+impl PartialEq<str> for StreamId {
     fn eq(&self, other: &str) -> bool {
         self.inner.eq(other)
     }
 }
 
-impl PartialEq<&str> for StreamID {
+impl PartialEq<&str> for StreamId {
     fn eq(&self, other: &&str) -> bool {
         self.inner.eq(other)
     }
 }
 
-impl PartialEq<StreamID> for String {
-    fn eq(&self, other: &StreamID) -> bool {
+impl PartialEq<StreamId> for String {
+    fn eq(&self, other: &StreamId) -> bool {
         self.eq(&other.inner)
     }
 }
 
-impl PartialEq<StreamID> for str {
-    fn eq(&self, other: &StreamID) -> bool {
+impl PartialEq<StreamId> for str {
+    fn eq(&self, other: &StreamId) -> bool {
         self.eq(&other.inner)
     }
 }
 
-impl PartialEq<StreamID> for &str {
-    fn eq(&self, other: &StreamID) -> bool {
+impl PartialEq<StreamId> for &str {
+    fn eq(&self, other: &StreamId) -> bool {
         self.eq(&other.inner)
     }
 }
 
-impl AsRef<str> for StreamID {
+impl AsRef<str> for StreamId {
     fn as_ref(&self) -> &str {
         &self.inner
     }
 }
 
-impl AsRef<String> for StreamID {
+impl AsRef<String> for StreamId {
     fn as_ref(&self) -> &String {
         &self.inner
     }
 }
 
-impl ops::Deref for StreamID {
+impl ops::Deref for StreamId {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -283,7 +279,13 @@ impl ops::Deref for StreamID {
     }
 }
 
-impl Serialize for StreamID {
+impl borrow::Borrow<str> for StreamId {
+    fn borrow(&self) -> &str {
+        &self.inner
+    }
+}
+
+impl Serialize for StreamId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -292,7 +294,7 @@ impl Serialize for StreamID {
     }
 }
 
-impl<'de> Deserialize<'de> for StreamID {
+impl<'de> Deserialize<'de> for StreamId {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -300,7 +302,7 @@ impl<'de> Deserialize<'de> for StreamID {
         struct StreamNameVisitor;
 
         impl<'de> Visitor<'de> for StreamNameVisitor {
-            type Value = StreamID;
+            type Value = StreamId;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str("StreamName")
@@ -310,7 +312,7 @@ impl<'de> Deserialize<'de> for StreamID {
             where
                 E: de::Error,
             {
-                Ok(StreamID {
+                Ok(StreamId {
                     inner: v.to_string(),
                 })
             }
@@ -326,40 +328,40 @@ mod tests {
 
     #[test]
     fn test_new() {
-        let stream_name = StreamID::new("account:position-123+456");
+        let stream_name = StreamId::new("account:position-123+456");
         assert_eq!(stream_name.inner, "account:position-123+456");
     }
 
     #[test]
     fn test_ids() {
-        let stream_name = StreamID::new("category:command-123+456");
+        let stream_name = StreamId::new("category:command-123+456");
         let ids: Vec<&str> = stream_name.ids().collect();
         assert_eq!(ids, vec!["123", "456"]);
     }
 
     #[test]
     fn test_cardinal_id() {
-        let stream_name = StreamID::new("category:command-123+456");
+        let stream_name = StreamId::new("category:command-123+456");
         assert_eq!(stream_name.cardinal_id(), "123");
     }
 
     #[test]
     fn test_is_category() {
-        let stream_name_with_id = StreamID::new("category:command-123+456");
-        let stream_name_no_id = StreamID::new("category:command");
+        let stream_name_with_id = StreamId::new("category:command-123+456");
+        let stream_name_no_id = StreamId::new("category:command");
         assert!(stream_name_with_id.is_category());
         assert!(!stream_name_no_id.is_category());
     }
 
     #[test]
     fn test_category() {
-        let stream_name = StreamID::new("category:command-123+456");
+        let stream_name = StreamId::new("category:command-123+456");
         assert_eq!(stream_name.category(), "category:command");
     }
 
     #[test]
     fn test_entity_name() {
-        let stream_name = StreamID::new("category:command-123+456");
+        let stream_name = StreamId::new("category:command-123+456");
         assert_eq!(stream_name.entity_name(), "category:command");
     }
 
@@ -372,56 +374,56 @@ mod tests {
 
     #[test]
     fn test_set_id_from_category() {
-        let mut stream_name = StreamID::new("category");
+        let mut stream_name = StreamId::new("category");
         stream_name.set_id("123");
         assert_eq!(stream_name.inner, "category-123");
     }
 
     #[test]
     fn test_replace_id_with_set_id() {
-        let mut stream_name = StreamID::new("category-123");
+        let mut stream_name = StreamId::new("category-123");
         stream_name.set_id("456");
         assert_eq!(stream_name.inner, "category-456");
     }
 
     #[test]
     fn test_push_type_to_simple_category() {
-        let mut stream_name = StreamID::new("account");
+        let mut stream_name = StreamId::new("account");
         stream_name.push_type("position");
         assert_eq!(stream_name.inner, "account:position");
     }
 
     #[test]
     fn test_push_type_to_category_with_type() {
-        let mut stream_name = StreamID::new("account:position");
+        let mut stream_name = StreamId::new("account:position");
         stream_name.push_type("snapshot");
         assert_eq!(stream_name.inner, "account:position+snapshot");
     }
 
     #[test]
     fn test_push_type_to_category_with_multiple_types() {
-        let mut stream_name = StreamID::new("account:position+management");
+        let mut stream_name = StreamId::new("account:position+management");
         stream_name.push_type("snapshot");
         assert_eq!(stream_name.inner, "account:position+management+snapshot");
     }
 
     #[test]
     fn test_push_type_to_category_with_id() {
-        let mut stream_name = StreamID::new("account-123");
+        let mut stream_name = StreamId::new("account-123");
         stream_name.push_type("position");
         assert_eq!(stream_name.inner, "account:position-123");
     }
 
     #[test]
     fn test_push_type_to_category_with_type_and_id() {
-        let mut stream_name = StreamID::new("account:position-123");
+        let mut stream_name = StreamId::new("account:position-123");
         stream_name.push_type("snapshot");
         assert_eq!(stream_name.inner, "account:position+snapshot-123");
     }
 
     #[test]
     fn test_push_type_to_category_already_exists() {
-        let mut stream_name = StreamID::new("account:position-123");
+        let mut stream_name = StreamId::new("account:position-123");
         stream_name.push_type("position");
         assert_eq!(stream_name.inner, "account:position-123");
     }
