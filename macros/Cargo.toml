@@ -2,6 +2,13 @@
 name = "kameo_es_macros"
 version = "0.1.0"
 edition = "2021"
+authors = ["Ari Seyhun <dev@tqwewe.com>"]
+license = "MIT OR Apache-2.0"
+description = "Derive macros for kameo_es event sourcing library"
+homepage = "https://github.com/sierra-db/kameo_es"
+repository = "https://github.com/sierra-db/kameo_es"
+keywords = ["event-sourcing", "cqrs", "macros", "derive"]
+categories = ["development-tools::procedural-macro-helpers"]
 
 [lib]
 proc-macro = true

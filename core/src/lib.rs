@@ -1,10 +1,16 @@
 mod stream_id;
 pub mod test_utils;
 
-pub use kameo_es_macros::EventType;
-pub use stream_id::StreamID;
+pub use kameo_es_macros::{CommandName, EventType};
+pub use stream_id::StreamId;
 
-use std::{fmt, ops, str::FromStr, time::Instant};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    fmt, ops,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Utc};
 use ciborium::Value;
@@ -16,23 +22,40 @@ pub trait Entity: Default + Send + 'static {
     type Event: EventType + Clone + Serialize + DeserializeOwned + Send + Sync;
     type Metadata: Serialize + DeserializeOwned + Clone + Default + Unpin + Send + Sync + 'static;
 
-    fn name() -> &'static str;
+    // The *snake_case* name of the entity category. This *must not* contain hyphens.
+    fn category() -> &'static str;
 }
 
-pub trait Command<C>: Entity {
+pub trait Command<C: CommandName>: Entity {
     type Error: fmt::Debug + Send + Sync + 'static;
 
     fn handle(&self, cmd: C, ctx: Context<'_, Self>) -> Result<Vec<Self::Event>, Self::Error>;
 
-    /// Checks if the command can be processed idempotently.
-    ///
-    /// # Returns
-    ///
-    /// * `true` if the operation can be processed idempotently, meaning no side effects or duplicates will occur.
-    /// * `false` if processing the operation would cause an idempotency violation, and it should be avoided.
+    /// Returns true if this command should be skipped.
+    /// This includes:
+    /// - Already processed (exact duplicate)
+    /// - Out of order (older version than what we've seen)
+    /// - State-based idempotency
     fn is_idempotent(&self, _cmd: &C, ctx: Context<'_, Self>) -> bool {
-        !ctx.processed()
+        ctx.should_skip() || self.is_state_idempotent(_cmd, ctx)
     }
+
+    /// Override for state-based idempotency checks.
+    fn is_state_idempotent(&self, _cmd: &C, _ctx: Context<'_, Self>) -> bool {
+        false
+    }
+
+    /// Rate limiting behaviour for this command. Returns None by default.
+    fn rate_limit(&self) -> Option<RateLimit> {
+        None
+    }
+}
+
+pub trait CommandName {
+    // The *snake_case* name of the command.
+    //
+    // This is typically used for idempotency checks via causation metadata.
+    fn command_name() -> &'static str;
 }
 
 pub trait Apply
@@ -51,7 +74,7 @@ where
     E: Entity,
 {
     pub metadata: &'a Metadata<E::Metadata>,
-    pub last_causation: Option<&'a CausationMetadata>,
+    pub causation_tracking: &'a HashMap<StreamId, (u64, HashSet<Cow<'static, str>>)>,
     pub time: DateTime<Utc>,
     pub executed_at: Instant,
 }
@@ -60,11 +83,48 @@ impl<'a, E> Context<'a, E>
 where
     E: Entity,
 {
-    pub fn processed(&self) -> bool {
-        self.last_causation
-            .zip(self.metadata.causation.as_ref())
-            .map(|(last, current)| last.event_id >= current.event_id)
-            .unwrap_or(false)
+    /// Returns true if this command should be skipped due to causation
+    pub fn should_skip(&self) -> bool {
+        match self.check_causation() {
+            CausationCheck::Ok | CausationCheck::NoCausation => false,
+            CausationCheck::AlreadyProcessed | CausationCheck::OutOfOrder { .. } => true,
+        }
+    }
+
+    /// Detailed check if you need it for logging/debugging
+    pub fn check_causation(&self) -> CausationCheck {
+        match self.metadata.causation_event.as_ref() {
+            None => CausationCheck::NoCausation,
+            Some(causation_event) => {
+                match self.causation_tracking.get(&causation_event.stream_id) {
+                    None => CausationCheck::Ok, // Never seen this stream before
+                    Some((max_version, commands_at_max)) => {
+                        if causation_event.stream_version < *max_version {
+                            // Out of order - reject
+                            CausationCheck::OutOfOrder {
+                                received: causation_event.stream_version,
+                                max_seen: *max_version,
+                            }
+                        } else if causation_event.stream_version == *max_version {
+                            // Same version - check if command was already processed
+                            if self
+                                .metadata
+                                .causation_command
+                                .as_ref()
+                                .is_some_and(|cmd| commands_at_max.contains(&**cmd))
+                            {
+                                CausationCheck::AlreadyProcessed
+                            } else {
+                                CausationCheck::Ok
+                            }
+                        } else {
+                            // New higher version - will clear the command set
+                            CausationCheck::Ok
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn now(&self) -> DateTime<Utc> {
@@ -77,12 +137,7 @@ where
     E: Entity,
 {
     fn clone(&self) -> Self {
-        Context {
-            metadata: self.metadata,
-            last_causation: self.last_causation,
-            time: self.time,
-            executed_at: self.executed_at,
-        }
+        *self
     }
 }
 
@@ -96,18 +151,30 @@ where
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Context")
             .field("metadata", &self.metadata)
-            .field("last_causation", &self.last_causation)
+            .field("causation_tracking", &self.causation_tracking)
             .field("time", &self.time)
             .field("executed_at", &self.executed_at)
             .finish()
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CausationCheck {
+    Ok,
+    NoCausation,
+    AlreadyProcessed,
+    OutOfOrder { received: u64, max_seen: u64 },
+}
+
+#[derive(Clone, Debug)]
 pub struct Event<E = GenericValue, M = GenericValue> {
-    pub id: u64,
-    pub stream_id: StreamID,
+    pub id: Uuid,
+    pub partition_key: Uuid,
+    pub partition_id: u16,
+    pub transaction_id: Uuid,
+    pub partition_sequence: u64,
     pub stream_version: u64,
+    pub stream_id: StreamId,
     pub name: String,
     pub data: E,
     pub metadata: Metadata<M>,
@@ -115,17 +182,16 @@ pub struct Event<E = GenericValue, M = GenericValue> {
 }
 
 impl Event {
-    #[inline]
     pub fn as_entity<E>(
         self,
-    ) -> Result<Event<E::Event, E::Metadata>, (Event, ciborium::value::Error)>
+    ) -> Result<Event<E::Event, E::Metadata>, (Box<Event>, ciborium::value::Error)>
     where
         E: Entity,
     {
         let data = match self.data.0.deserialized() {
             Ok(data) => data,
             Err(err) => {
-                return Err((self, err));
+                return Err((Box::new(self), err));
             }
         };
 
@@ -133,15 +199,19 @@ impl Event {
             Ok(metadata) => metadata,
             Err(CastMetadataError { err, metadata }) => {
                 return Err((
-                    Event {
+                    Box::new(Event {
                         id: self.id,
-                        stream_id: self.stream_id,
+                        partition_key: self.partition_key,
+                        partition_id: self.partition_id,
+                        transaction_id: self.transaction_id,
+                        partition_sequence: self.partition_sequence,
                         stream_version: self.stream_version,
+                        stream_id: self.stream_id,
                         name: self.name,
                         data: self.data,
-                        metadata,
+                        metadata: *metadata,
                         timestamp: self.timestamp,
-                    },
+                    }),
                     err,
                 ))
             }
@@ -149,8 +219,12 @@ impl Event {
 
         Ok(Event {
             id: self.id,
-            stream_id: self.stream_id,
+            partition_key: self.partition_key,
+            partition_id: self.partition_id,
+            transaction_id: self.transaction_id,
+            partition_sequence: self.partition_sequence,
             stream_version: self.stream_version,
+            stream_id: self.stream_id,
             name: self.name,
             data,
             metadata,
@@ -172,19 +246,24 @@ impl<E, M> Event<E, M> {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Metadata<T> {
+    #[serde(rename = "ccmd", skip_serializing_if = "Option::is_none")]
+    pub causation_command: Option<Cow<'static, str>>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
-    pub causation: Option<CausationMetadata>,
-    #[serde(rename = "cid")]
-    pub correlation_id: Uuid,
-    pub data: T,
+    pub causation_event: Option<EventCausation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<T>,
 }
 
 impl<T> Metadata<T> {
+    pub fn is_empty(&self) -> bool {
+        self.causation_command.is_none() && self.causation_event.is_none() && self.data.is_none()
+    }
+
     pub fn with_data<U>(self, data: U) -> Metadata<U> {
         Metadata {
-            causation: self.causation,
-            correlation_id: self.correlation_id,
-            data,
+            causation_command: self.causation_command,
+            causation_event: self.causation_event,
+            data: Some(data),
         }
     }
 }
@@ -194,29 +273,29 @@ impl Metadata<GenericValue> {
     where
         U: DeserializeOwned + Default,
     {
-        let data = if matches!(self.data, GenericValue(Value::Null)) {
-            U::default()
-        } else {
-            match self.data.0.deserialized() {
-                Ok(data) => data,
+        let data = match &self.data {
+            Some(GenericValue(Value::Null)) => Some(U::default()),
+            Some(data) => match data.0.deserialized() {
+                Ok(data) => Some(data),
                 Err(err) => {
                     return Err(CastMetadataError {
                         err,
-                        metadata: self,
-                    })
+                        metadata: Box::new(self),
+                    });
                 }
-            }
+            },
+            None => None,
         };
         Ok(Metadata {
-            causation: self.causation,
-            correlation_id: self.correlation_id,
+            causation_command: self.causation_command,
+            causation_event: self.causation_event,
             data,
         })
     }
 }
 
 impl<T> ops::Deref for Metadata<T> {
-    type Target = T;
+    type Target = Option<T>;
 
     fn deref(&self) -> &Self::Target {
         &self.data
@@ -230,21 +309,19 @@ impl<T> ops::DerefMut for Metadata<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CausationMetadata {
+pub struct EventCausation {
     #[serde(rename = "ceid")]
-    pub event_id: u64,
+    pub event_id: Uuid,
     #[serde(rename = "csid")]
-    pub stream_id: StreamID,
+    pub stream_id: StreamId,
     #[serde(rename = "csv")]
     pub stream_version: u64,
-    #[serde(rename = "ccid")]
-    pub correlation_id: Uuid,
 }
 
 #[derive(Debug)]
 pub struct CastMetadataError {
     pub err: ciborium::value::Error,
-    pub metadata: Metadata<GenericValue>,
+    pub metadata: Box<Metadata<GenericValue>>,
 }
 
 impl fmt::Display for CastMetadataError {
@@ -277,4 +354,9 @@ impl ops::DerefMut for GenericValue {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
+}
+
+pub struct RateLimit {
+    pub max_requests: u32,
+    pub window_duration: Duration,
 }

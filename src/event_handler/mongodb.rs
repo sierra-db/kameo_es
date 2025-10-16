@@ -1,4 +1,4 @@
-use std::ops;
+use std::{collections::HashMap, ops};
 
 use mongodb::{
     bson::{bson, doc},
@@ -50,7 +50,7 @@ pub struct MongoDBEventProcessor<H> {
     checkpoints_collection: Collection<Checkpoint>,
     projection_id: String,
     handler: H,
-    last_handled_event: Option<u64>,
+    last_handled_sequences: HashMap<u16, u64>,
     flush_interval: u64,
 }
 
@@ -63,17 +63,18 @@ impl<H> MongoDBEventProcessor<H> {
     ) -> anyhow::Result<Self> {
         let projection_id = projection_id.into();
 
-        let last_handled_event = checkpoints_collection
+        let last_handled_sequences = checkpoints_collection
             .find_one(doc! { "_id": &projection_id })
             .await?
-            .map(|checkpoint: Checkpoint| checkpoint.last_event_id as u64);
+            .map(|checkpoint: Checkpoint| checkpoint.last_handled_sequences)
+            .unwrap_or_default();
 
         Ok(MongoDBEventProcessor {
             client,
             checkpoints_collection,
             projection_id,
             handler,
-            last_handled_event,
+            last_handled_sequences,
             flush_interval: 100,
         })
     }
@@ -89,8 +90,8 @@ impl<H> MongoDBEventProcessor<H> {
         &mut self.handler
     }
 
-    pub fn last_handled_event(&self) -> Option<u64> {
-        self.last_handled_event
+    pub fn last_handled_sequences(&self) -> &HashMap<u16, u64> {
+        &self.last_handled_sequences
     }
 }
 
@@ -101,8 +102,12 @@ where
     type Context = Session;
     type Error = MongoEventProcessorError;
 
-    async fn start_from(&self) -> Result<u64, Self::Error> {
-        Ok(self.last_handled_event.map(|n| n + 1).unwrap_or(0))
+    async fn start_from(&self) -> Result<HashMap<u16, u64>, Self::Error> {
+        Ok(self
+            .last_handled_sequences
+            .iter()
+            .map(|(partition_id, sequence)| (*partition_id, sequence + 1))
+            .collect())
     }
 
     async fn process_event(
@@ -124,12 +129,20 @@ where
 
         let Session { mut session, dirty } = session;
 
-        let events_since_last_flush = self
-            .last_handled_event
-            .map(|last| event_id - last)
-            .unwrap_or(u64::MAX);
+        // Flush if we've processed more events than the flush interval events threshold
+        let events_since_flush: u64 = self
+            .last_handled_sequences
+            .iter()
+            .map(|(partition_id, sequence)| {
+                last_flushed
+                    .1
+                    .get(partition_id)
+                    .map(|last_flushed_sequence| sequence - last_flushed_sequence)
+                    .unwrap_or(0)
+            })
+            .sum();
         if dirty || events_since_last_flush > self.flush_interval {
-            let expected_last_event_id = match self.last_handled_event {
+            let expected_last_event_id = match self.last_handled_sequences {
                 Some(last) => bson!({ "$eq": last as i64 }),
                 None => bson!({ "$exists": false }),
             };
@@ -147,7 +160,7 @@ where
                         session.abort_transaction().await?;
                         return Err(EventHandlerError::Processor(
                             MongoEventProcessorError::UnexpectedLastEventId {
-                                expected: self.last_handled_event,
+                                expected: self.last_handled_sequences,
                             },
                         ));
                     }
@@ -157,7 +170,7 @@ where
 
             session.commit_transaction().await?;
 
-            self.last_handled_event = Some(event_id);
+            self.last_handled_sequences = Some(event_id);
         } else {
             debug!(event_id = %event_id, "ignoring event");
         }
@@ -170,15 +183,17 @@ where
 pub struct Checkpoint {
     #[serde(rename = "_id")]
     pub id: String,
-    pub last_event_id: u64,
+    pub last_handled_sequences: HashMap<u16, u64>,
 }
 
 #[derive(Debug, Error)]
 pub enum MongoEventProcessorError {
     #[error("unexpected last event id, expected {expected:?}")]
-    UnexpectedLastEventId { expected: Option<u64> },
+    UnexpectedLastSequences { expected: HashMap<u16, u64> },
     #[error(transparent)]
     Mongodb(#[from] mongodb::error::Error),
+    #[error(transparent)]
+    SerializeBson(#[from] bson::ser::Error),
 }
 
 impl<H> From<mongodb::error::Error> for EventHandlerError<MongoEventProcessorError, H> {

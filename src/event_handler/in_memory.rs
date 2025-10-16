@@ -1,4 +1,4 @@
-use std::convert::Infallible;
+use std::{collections::HashMap, convert::Infallible};
 
 use crate::{
     event_handler::{CompositeEventHandler, EventHandler, EventHandlerError, EventProcessor},
@@ -26,8 +26,8 @@ where
     type Context = ();
     type Error = Infallible;
 
-    async fn start_from(&self) -> Result<u64, Self::Error> {
-        Ok(0)
+    async fn start_from(&self) -> Result<HashMap<u16, u64>, Self::Error> {
+        Ok(HashMap::new())
     }
 
     async fn process_event(

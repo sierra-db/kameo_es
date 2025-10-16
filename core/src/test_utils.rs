@@ -1,8 +1,8 @@
-use std::{fmt, time::Instant};
+use std::{collections::HashMap, fmt, time::Instant};
 
 use chrono::Utc;
 
-use crate::{Apply, Command, Entity, Metadata};
+use crate::{Apply, Command, CommandName, Entity, Metadata};
 
 pub trait GivenEntity: Entity + Apply {
     fn given(events: impl Into<Vec<Self::Event>>) -> Given<Self>;
@@ -35,6 +35,7 @@ where
     pub fn when<C>(mut self, cmd: C) -> When<E, C>
     where
         E: Entity + Command<C> + Apply,
+        C: CommandName,
     {
         for event in self.events {
             self.entity.apply(event, Metadata::default());
@@ -50,6 +51,7 @@ where
 pub struct When<E, C>
 where
     E: Entity + Command<C>,
+    C: CommandName,
 {
     entity: E,
     cmd: C,
@@ -58,6 +60,7 @@ where
 impl<E, C> When<E, C>
 where
     E: Entity + Command<C>,
+    C: CommandName,
 {
     pub fn then(self, events: impl Into<Vec<E::Event>>) -> Given<E>
     where
@@ -66,10 +69,17 @@ where
         let metadata = Metadata::default();
         let ctx = crate::Context {
             metadata: &metadata,
-            last_causation: None,
+            causation_tracking: &HashMap::new(),
             time: Utc::now(),
             executed_at: Instant::now(),
         };
+        let is_idempotent = self.entity.is_idempotent(&self.cmd, ctx);
+        if is_idempotent {
+            return Given {
+                entity: self.entity,
+                events: vec![],
+            };
+        }
         let true_events = self
             .entity
             .handle(self.cmd, ctx)
@@ -91,7 +101,7 @@ where
         let metadata = Metadata::default();
         let ctx = crate::Context {
             metadata: &metadata,
-            last_causation: None,
+            causation_tracking: &HashMap::new(),
             time: Utc::now(),
             executed_at: Instant::now(),
         };
@@ -107,6 +117,23 @@ where
         }
     }
 
+    pub fn then_idempotent(self) -> Given<E> {
+        let metadata = Metadata::default();
+        let ctx = crate::Context {
+            metadata: &metadata,
+            causation_tracking: &HashMap::new(),
+            time: Utc::now(),
+            executed_at: Instant::now(),
+        };
+        let is_idempotent = self.entity.is_idempotent(&self.cmd, ctx);
+        assert!(is_idempotent, "expected command to be idempotent");
+
+        Given {
+            entity: self.entity,
+            events: Vec::new(),
+        }
+    }
+
     pub fn and_then<F>(self, f: F) -> Given<E>
     where
         F: FnOnce(Vec<E::Event>),
@@ -114,7 +141,7 @@ where
         let metadata = Metadata::default();
         let ctx = crate::Context {
             metadata: &metadata,
-            last_causation: None,
+            causation_tracking: &HashMap::new(),
             time: Utc::now(),
             executed_at: Instant::now(),
         };
