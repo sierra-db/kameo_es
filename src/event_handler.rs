@@ -1,15 +1,17 @@
-// pub mod file;
+pub mod file;
 pub mod in_memory;
-#[cfg(feature = "mongodb")]
-pub mod mongodb;
+// #[cfg(feature = "mongodb")]
+// pub mod mongodb;
 #[cfg(feature = "mongodb")]
 pub mod mongodb_bulk;
-#[cfg(feature = "mongodb")]
-pub mod mongodb_correlations;
+// #[cfg(feature = "mongodb")]
+// pub mod mongodb_correlations;
 // #[cfg(feature = "polodb")]
 // pub mod polodb;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 use std::{collections::HashMap, marker::PhantomData};
 
@@ -17,7 +19,7 @@ use futures::Future;
 use redis::RedisError;
 use sierradb_client::{EventSubscription, SierraError, SierraMessage, SubscriptionManager};
 use thiserror::Error;
-use tracing::info;
+use tracing::{debug, trace};
 
 use crate::{event_from_sierra, Entity, Event, TryFromSierraEventError};
 
@@ -49,6 +51,10 @@ pub trait EventHandler<C>: Send {
         _ctx: &mut C,
         _event: Event,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move { Ok(()) }
+    }
+
+    fn flush(&mut self, _ctx: &mut C) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move { Ok(()) }
     }
 }
@@ -83,23 +89,23 @@ where
 
 /// A helper trait for creating an event handler stream.
 pub trait EventHandlerStreamBuilder: Sized + 'static {
-    fn event_handler_stream<'a, P, H>(
+    fn event_handler_stream<P, H>(
         manager: &mut SubscriptionManager,
-        processor: &'a mut P,
+        processor: &mut P,
     ) -> impl Future<Output = Result<EventHandlerStream<Self>, EventHandlerError<P::Error, H::Error>>>
     where
-        P: EventProcessor<Self, H> + 'static,
-        H: EventHandler<P::Context> + 'static;
+        P: EventProcessor<Self, H>,
+        H: EventHandler<P::Context>;
 }
 
 impl<E: 'static> EventHandlerStreamBuilder for E {
-    async fn event_handler_stream<'a, P, H>(
+    async fn event_handler_stream<P, H>(
         manager: &mut SubscriptionManager,
-        processor: &'a mut P,
+        processor: &mut P,
     ) -> Result<EventHandlerStream<Self>, EventHandlerError<P::Error, H::Error>>
     where
-        P: EventProcessor<Self, H> + 'static,
-        H: EventHandler<P::Context> + 'static,
+        P: EventProcessor<Self, H>,
+        H: EventHandler<P::Context>,
     {
         EventHandlerStream::new(manager, processor).await
     }
@@ -154,7 +160,7 @@ impl<E> EventHandlerStream<E> {
             .await
             .map_err(EventHandlerError::Processor)?;
         let subscription = manager
-            .subscribe_to_all_partitions_flexible(start_from, Some(0), Some(1_000))
+            .subscribe_to_all_partitions_flexible(start_from, Some(0), Some(10_000))
             .await?;
 
         Ok(EventHandlerStream {
@@ -194,14 +200,13 @@ impl<E> EventHandlerStream<E> {
         Ok(())
     }
 
-    pub async fn next<P, H>(
-        &mut self,
-    ) -> Option<Result<UnprocessedEvent<E>, EventHandlerError<P, H>>> {
+    pub async fn next(&mut self) -> Option<Result<UnprocessedEvent<E>, NextEventError>> {
         while let Some(event) = self.subscription.next_message().await {
             match event {
                 SierraMessage::Event { event, cursor } => {
                     self.events_since_ack += 1;
-                    if self.events_since_ack >= 800 {
+                    if self.events_since_ack >= 8_000 {
+                        trace!("acknowledging up to cursor {cursor}");
                         if let Err(err) = self.subscription.acknowledge_up_to_cursor(cursor).await {
                             return Some(Err(err.into()));
                         }
@@ -219,6 +224,29 @@ impl<E> EventHandlerStream<E> {
         }
 
         None
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NextEventError {
+    #[error(transparent)]
+    Sierra(#[from] SierraError),
+    #[error(transparent)]
+    DeserializeEvent(#[from] TryFromSierraEventError),
+}
+
+impl From<RedisError> for NextEventError {
+    fn from(err: RedisError) -> Self {
+        NextEventError::Sierra(err.into())
+    }
+}
+
+impl<P, H> From<NextEventError> for EventHandlerError<P, H> {
+    fn from(err: NextEventError) -> Self {
+        match err {
+            NextEventError::Sierra(err) => EventHandlerError::Sierra(err),
+            NextEventError::DeserializeEvent(err) => EventHandlerError::EventFromSierra(err),
+        }
     }
 }
 
@@ -244,8 +272,9 @@ impl<E> UnprocessedEvent<E> {
         P: EventProcessor<E, H>,
         H: EventHandler<P::Context>,
     {
-        info!(
-            "{} {:<32} {:>6} > {}",
+        debug!(
+            "{:>2}:{:>6} {:<32} {:>6} > {}",
+            self.event.partition_id,
             self.event.partition_sequence,
             self.event.stream_id,
             self.event.stream_version,
@@ -282,7 +311,7 @@ macro_rules! impl_composite_event_handler {
                 $(
                     let category = event.stream_id.category();
                     $(
-                        if category == $ent::name() {
+                        if category == $ent::category() {
                             EntityEventHandler::<$ent, C>::handle(
                                 self,
                                 ctx,
@@ -291,7 +320,7 @@ macro_rules! impl_composite_event_handler {
                                 })?,
                                 event.as_entity::<$ent>().map_err(|(event, err)| {
                                     EventHandlerError::DeserializeEvent {
-                                        entity: $ent::name(),
+                                        entity: $ent::category(),
                                         event: event.name,
                                         err,
                                     }

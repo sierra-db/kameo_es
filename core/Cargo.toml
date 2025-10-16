@@ -2,11 +2,18 @@
 name = "kameo_es_core"
 version = "0.1.0"
 edition = "2021"
+authors = ["Ari Seyhun <dev@tqwewe.com>"]
+license = "MIT OR Apache-2.0"
+description = "Core types and traits for kameo_es event sourcing library"
+homepage = "https://github.com/sierra-db/kameo_es"
+repository = "https://github.com/sierra-db/kameo_es"
+keywords = ["event-sourcing", "cqrs", "actors", "kameo"]
+categories = ["database", "concurrency", "asynchronous"]
 
 [dependencies]
 kameo_es_macros = { path = "../macros" }
 
-chrono = { version = "0.4", features = ["serde"] }
-ciborium = "0.2.2"
-serde = { version = "1.0.197", features = ["derive"] }
-uuid = { version = "1.10", features = ["serde", "v4"] }
+chrono.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+uuid.workspace = true

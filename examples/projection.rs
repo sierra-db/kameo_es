@@ -6,28 +6,25 @@ use kameo_es::{
         in_memory::InMemoryEventProcessor, EntityEventHandler, EventHandler,
         EventHandlerStreamBuilder,
     },
-    Apply, Command, Entity, Event, EventType, Metadata,
+    Apply, Command, CommandName, Entity, Event, EventType, Metadata,
 };
 use redis::Value;
 use serde::{Deserialize, Serialize};
-use sierradb_client::{AsyncTypedCommands, SierraAsyncClientExt};
+use sierradb_client::SierraAsyncClientExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let client = redis::Client::open("redis://127.0.0.1:9090?protocol=resp3")?;
-
     let mut conn = client.get_multiplexed_tokio_connection().await?;
-    let mut cmd_service = CommandService::new(conn.clone());
+    let cmd_service = CommandService::new(conn.clone());
+    let mut subscriptions = client.subscription_manager().await?;
+
     MyEntity::execute(&cmd_service, "abc".to_string(), MyEntityEvent::Foo {}).await?;
-
-    let resp: Value = redis::cmd("HELLO").arg("3").query_async(&mut conn).await?;
-    dbg!(resp);
-
-    let mut manager = client.subscription_manager().await?;
 
     let mut processor = InMemoryEventProcessor::new(EventKindCounter::default());
 
-    let mut stream = <(MyEntity,)>::event_handler_stream(&mut manager, &mut processor).await?;
+    let mut stream =
+        <(MyEntity,)>::event_handler_stream(&mut subscriptions, &mut processor).await?;
     stream.run(&mut processor).await?;
 
     Ok(())
@@ -43,12 +40,12 @@ impl Entity for MyEntity {
     type Event = MyEntityEvent;
     type Metadata = ();
 
-    fn name() -> &'static str {
+    fn category() -> &'static str {
         "my_entity"
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, CommandName, Serialize, Deserialize)]
 pub enum MyEntityEvent {
     Foo {},
     Bar {},
@@ -66,7 +63,7 @@ impl EventType for MyEntityEvent {
 }
 
 impl Apply for MyEntity {
-    fn apply(&mut self, event: Self::Event, metadata: Metadata<Self::Metadata>) {}
+    fn apply(&mut self, _event: Self::Event, _metadata: Metadata<Self::Metadata>) {}
 }
 
 impl Command<MyEntityEvent> for MyEntity {
@@ -75,7 +72,7 @@ impl Command<MyEntityEvent> for MyEntity {
     fn handle(
         &self,
         cmd: MyEntityEvent,
-        ctx: kameo_es::Context<'_, Self>,
+        _ctx: kameo_es::Context<'_, Self>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
         println!("runnning");
         Ok(vec![cmd])

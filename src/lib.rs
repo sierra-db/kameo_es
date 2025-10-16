@@ -2,7 +2,6 @@ pub mod command_service;
 pub mod entity_actor;
 pub mod error;
 pub mod event_handler;
-// mod event_store;
 pub mod transaction;
 
 use std::{convert::Infallible, io};
@@ -12,7 +11,6 @@ use sierradb_client::SierraError;
 use thiserror::Error;
 
 pub use kameo_es_core::*;
-use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum Error<M = (), E = Infallible> {
@@ -22,32 +20,6 @@ pub enum Error<M = (), E = Infallible> {
     SendError(#[from] SendError<M, E>),
 }
 
-// pub async fn subscribe(
-//     mut client: MultiplexedConnection,
-//     start_from: Option<u64>,
-// ) -> Result<BoxStream<'static, Result<Vec<Event>, Status>>, Status> {
-//     client.epsub_by_key_from_sequence(partition_key, from_sequence)
-
-//     let stream = client
-//         .subscribe(SubscribeRequest {
-//             start_from: Some(start_from),
-//         })
-//         .await?
-//         .into_inner();
-
-//     Ok(stream
-//         .and_then(|EventBatch { events }| async move {
-//             events
-//                 .into_iter()
-//                 .map(|event| {
-//                     event_from_eventus(event)
-//                         .map_err(|err| Status::new(Code::Internal, err.to_string()))
-//                 })
-//                 .collect()
-//         })
-//         .boxed())
-// }
-
 #[derive(Debug, Error)]
 pub enum TryFromSierraEventError {
     #[error("failed to deserialize event data: {0}")]
@@ -56,7 +28,6 @@ pub enum TryFromSierraEventError {
     DeserializeEventMetadata(ciborium::de::Error<io::Error>),
 }
 
-// fn event_from_sierra<E: DeserializeOwned, M: DeserializeOwned + Default>(
 fn event_from_sierra(ev: sierradb_client::Event) -> Result<Event, TryFromSierraEventError> {
     let data = if !ev.payload.is_empty() {
         ciborium::from_reader(ev.payload.as_slice())
@@ -68,11 +39,7 @@ fn event_from_sierra(ev: sierradb_client::Event) -> Result<Event, TryFromSierraE
         ciborium::from_reader(ev.metadata.as_slice())
             .map_err(TryFromSierraEventError::DeserializeEventMetadata)?
     } else {
-        Metadata {
-            causation: None,
-            correlation_id: Uuid::nil(),
-            data: None,
-        }
+        Metadata::default()
     };
 
     Ok(Event {
@@ -121,7 +88,7 @@ macro_rules! match_event {
     }) => {{
         let category = $event.stream_id.category();
         $(
-            if category == $ent::name() {
+            if category == $ent::category() {
                 let $event = $event.as_entity::<$ent>();
                 {
                     let _res = $handle;

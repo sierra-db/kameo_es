@@ -1,10 +1,11 @@
 use std::{
     collections::HashMap,
     io::{self, SeekFrom},
+    marker::PhantomData,
     path::Path,
 };
 
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
     fs::{self, File},
@@ -17,16 +18,131 @@ use crate::{
     Event,
 };
 
-pub struct FileEventProcessor<H> {
+pub struct CborSerializer;
+pub struct JsonSerializer;
+
+pub trait FileSerializer: Send {
+    type DeError: Send;
+    type SerError: Send;
+
+    fn from_slice<T>(slice: &[u8]) -> Result<T, Self::DeError>
+    where
+        T: DeserializeOwned;
+
+    fn to_vec<T>(value: &T) -> Result<Vec<u8>, Self::SerError>
+    where
+        T: Serialize;
+}
+
+impl FileSerializer for CborSerializer {
+    type DeError = ciborium::de::Error<std::io::Error>;
+    type SerError = ciborium::ser::Error<std::io::Error>;
+
+    fn from_slice<T>(slice: &[u8]) -> Result<T, Self::DeError>
+    where
+        T: DeserializeOwned,
+    {
+        ciborium::from_reader(slice)
+    }
+
+    fn to_vec<T>(value: &T) -> Result<Vec<u8>, Self::SerError>
+    where
+        T: Serialize,
+    {
+        let mut buf = Vec::new();
+        ciborium::into_writer(value, &mut buf)?;
+        Ok(buf)
+    }
+}
+
+impl FileSerializer for JsonSerializer {
+    type DeError = serde_json::Error;
+    type SerError = serde_json::Error;
+
+    fn from_slice<T>(slice: &[u8]) -> Result<T, Self::DeError>
+    where
+        T: DeserializeOwned,
+    {
+        serde_json::from_slice(slice)
+    }
+
+    fn to_vec<T>(value: &T) -> Result<Vec<u8>, Self::SerError>
+    where
+        T: Serialize,
+    {
+        serde_json::to_vec_pretty(value)
+    }
+}
+
+pub struct FileEventProcessor<H: Hydrate, S: FileSerializer> {
     file: File,
     handler: H,
     flush_interval: u64,
-    last_event_sequence: HashMap<u16, u64>,
-    last_flush: Option<u64>,
+    last_partition_sequences: HashMap<u16, u64>,
+    events_since_flush: u64,
+    phantom: PhantomData<S>,
 }
 
-impl<H> FileEventProcessor<H> {
-    pub async fn new(path: impl AsRef<Path>) -> Result<Self, FileEventProcessorError>
+pub trait Hydrate {
+    type OwnedState: DeserializeOwned + Send + Sync;
+    type BorrowedState<'s>: Serialize + Send + Sync
+    where
+        Self: 's;
+
+    fn hydrate(&mut self, state: Self::OwnedState);
+    fn state<'s>(&'s self) -> Self::BorrowedState<'s>;
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct SavedData<S, T> {
+    last_partition_sequences: S,
+    data: T,
+}
+
+impl<T> SavedData<HashMap<u16, u64>, T> {
+    async fn load<S>(
+        file: &mut File,
+    ) -> Result<Option<Self>, FileEventProcessorError<S::DeError, S::SerError>>
+    where
+        T: DeserializeOwned,
+        S: FileSerializer,
+    {
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).await?;
+        if buf.is_empty() {
+            return Ok(None);
+        }
+
+        S::from_slice(buf.as_slice()).map_err(FileEventProcessorError::DeserializeState)
+    }
+}
+
+impl<'a, T> SavedData<&'a HashMap<u16, u64>, T> {
+    async fn save<S>(
+        &'a self,
+        file: &mut File,
+    ) -> Result<(), FileEventProcessorError<S::DeError, S::SerError>>
+    where
+        T: Serialize + 'a,
+        S: FileSerializer,
+    {
+        let bytes = S::to_vec(self).map_err(FileEventProcessorError::SerializeState)?;
+
+        file.set_len(0).await?;
+        file.seek(SeekFrom::Start(0)).await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+
+        Ok(())
+    }
+}
+
+impl<H: Hydrate, S: FileSerializer> FileEventProcessor<H, S> {
+    pub async fn new(
+        path: impl AsRef<Path>,
+        mut handler: H,
+    ) -> Result<Self, FileEventProcessorError<S::DeError, S::SerError>>
     where
         H: Default + DeserializeOwned,
     {
@@ -34,30 +150,28 @@ impl<H> FileEventProcessor<H> {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(path)
             .await?;
 
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf).await?;
-        let (handler, last_event_sequence) = if !buf.is_empty() {
-            let last_event_id = u64::from_le_bytes(
-                buf[..8]
-                    .try_into()
-                    .map_err(|_| FileEventProcessorError::DeserializeLastEventId)?,
-            );
-            let bytes = buf.split_off(8);
-            let handler = ciborium::from_reader(bytes.as_slice())?;
-            (handler, Some(last_event_id))
-        } else {
-            (H::default(), None)
+        let last_partition_sequences = match SavedData::load::<S>(&mut file).await? {
+            Some(SavedData {
+                last_partition_sequences,
+                data,
+            }) => {
+                handler.hydrate(data);
+                last_partition_sequences
+            }
+            None => HashMap::new(),
         };
 
         Ok(FileEventProcessor {
             file,
             handler,
             flush_interval: 20,
-            last_event_sequence,
-            last_flush: None,
+            last_partition_sequences,
+            events_since_flush: 0,
+            phantom: PhantomData,
         })
     }
 
@@ -74,79 +188,83 @@ impl<H> FileEventProcessor<H> {
         self
     }
 
-    pub async fn flush(&mut self) -> Result<(), FileEventProcessorError>
-    where
-        H: Serialize,
-    {
-        let Some(last_event_id) = self.last_event_sequence else {
-            return Ok(());
-        };
-        if Some(last_event_id) <= self.last_flush {
-            return Ok(());
+    pub async fn flush(&mut self) -> Result<(), FileEventProcessorError<S::DeError, S::SerError>> {
+        info!("flushing");
+
+        SavedData {
+            last_partition_sequences: &self.last_partition_sequences,
+            data: self.handler.state(),
         }
-        let events_since_last_flush = self
-            .last_flush
-            .map(|last_flush| last_event_id - last_flush)
-            .unwrap_or(u64::MAX);
-        if events_since_last_flush < self.flush_interval {
-            return Ok(());
-        }
+        .save::<S>(&mut self.file)
+        .await?;
 
-        info!("flushing at {last_event_id}");
-
-        let mut state_bytes = Vec::new();
-        ciborium::into_writer(&self.handler, &mut state_bytes)?;
-
-        let mut bytes = Vec::with_capacity(8 + state_bytes.len());
-        bytes.extend_from_slice(&last_event_id.to_le_bytes());
-        bytes.extend_from_slice(&state_bytes);
-
-        self.file.set_len(0).await?;
-        self.file.seek(SeekFrom::Start(0)).await?;
-        self.file.write_all(&bytes).await?;
-        self.file.flush().await?;
-        self.file.sync_all().await?;
-
-        self.last_flush = Some(last_event_id);
+        self.events_since_flush = 0;
 
         Ok(())
     }
+
+    pub async fn flush_if_needed(
+        &mut self,
+    ) -> Result<(), FileEventProcessorError<S::DeError, S::SerError>> {
+        if self.last_partition_sequences.is_empty() {
+            return Ok(());
+        }
+
+        if self.events_since_flush < self.flush_interval {
+            return Ok(());
+        }
+
+        self.flush().await
+    }
 }
 
-impl<E, H> EventProcessor<E, H> for FileEventProcessor<H>
+impl<E, H, S> EventProcessor<E, H> for FileEventProcessor<H, S>
 where
-    H: EventHandler<()> + CompositeEventHandler<E, (), FileEventProcessorError> + Serialize,
+    H: EventHandler<()>
+        + CompositeEventHandler<E, (), FileEventProcessorError<S::DeError, S::SerError>>
+        + Hydrate
+        + 'static,
+    S: FileSerializer,
 {
     type Context = ();
-    type Error = FileEventProcessorError;
+    type Error = FileEventProcessorError<S::DeError, S::SerError>;
 
     async fn start_from(&self) -> Result<HashMap<u16, u64>, Self::Error> {
-        Ok(self.last_event_sequence.map(|n| n + 1).unwrap_or(0))
+        Ok(self
+            .last_partition_sequences
+            .iter()
+            .map(|(partition_id, sequence)| (*partition_id, sequence + 1))
+            .collect())
     }
 
     async fn process_event(
         &mut self,
         event: Event,
     ) -> Result<(), EventHandlerError<Self::Error, <H as EventHandler<()>>::Error>> {
-        let sequence = event.partition_sequence;
+        let partition_id = event.partition_id;
+        let partition_sequence = event.partition_sequence;
 
         self.handler.composite_handle(&mut (), event).await?;
 
-        self.last_event_sequence = Some(sequence);
-        self.flush().await.map_err(EventHandlerError::Processor)?;
+        self.last_partition_sequences
+            .insert(partition_id, partition_sequence);
+        self.events_since_flush += 1;
+        self.flush_if_needed()
+            .await
+            .map_err(EventHandlerError::Processor)?;
 
         Ok(())
     }
 }
 
 #[derive(Debug, Error)]
-pub enum FileEventProcessorError {
+pub enum FileEventProcessorError<D, S> {
     #[error("failed to deserialize last event id")]
     DeserializeLastEventId,
     #[error(transparent)]
-    DeserializeState(#[from] ciborium::de::Error<io::Error>),
+    DeserializeState(D),
     #[error(transparent)]
-    SerializeState(#[from] ciborium::ser::Error<io::Error>),
+    SerializeState(S),
     #[error(transparent)]
     Io(#[from] io::Error),
 }

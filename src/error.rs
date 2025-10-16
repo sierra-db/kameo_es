@@ -1,4 +1,4 @@
-use std::{io, str::FromStr, sync::Arc};
+use std::{io, str::FromStr, sync::Arc, time::Duration};
 
 use once_cell::sync::Lazy;
 use regex::Regex;
@@ -16,16 +16,6 @@ pub enum ExecuteError<E> {
     CommandServiceNotRunning,
     #[error("command service stopped")]
     CommandServiceStopped,
-    #[error(
-        "entity '{entity}' has existing correlation id {existing} which does not match the one set {new}"
-    )]
-    CorrelationIDMismatch {
-        entity: &'static str,
-        existing: Uuid,
-        new: Uuid,
-    },
-    #[error("entity has no correlation id but contains events")]
-    CorrelationIDNotSetOnExistingEntity,
     #[error(transparent)]
     Database(#[from] SierraError),
     #[error("entity '{category}-{id}' actor not running")]
@@ -65,6 +55,11 @@ pub enum ExecuteError<E> {
         entity: &'static str,
         existing: Uuid,
         new: Uuid,
+    },
+    #[error("rate limit exceeded")]
+    RateLimitExceeded {
+        max_requests: u32,
+        window_duration: Duration,
     },
 }
 

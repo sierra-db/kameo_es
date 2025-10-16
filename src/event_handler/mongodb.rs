@@ -129,10 +129,18 @@ where
 
         let Session { mut session, dirty } = session;
 
-        let events_since_last_flush = self
+        // Flush if we've processed more events than the flush interval events threshold
+        let events_since_flush: u64 = self
             .last_handled_sequences
-            .map(|last| event_id - last)
-            .unwrap_or(u64::MAX);
+            .iter()
+            .map(|(partition_id, sequence)| {
+                last_flushed
+                    .1
+                    .get(partition_id)
+                    .map(|last_flushed_sequence| sequence - last_flushed_sequence)
+                    .unwrap_or(0)
+            })
+            .sum();
         if dirty || events_since_last_flush > self.flush_interval {
             let expected_last_event_id = match self.last_handled_sequences {
                 Some(last) => bson!({ "$eq": last as i64 }),
@@ -181,9 +189,11 @@ pub struct Checkpoint {
 #[derive(Debug, Error)]
 pub enum MongoEventProcessorError {
     #[error("unexpected last event id, expected {expected:?}")]
-    UnexpectedLastEventId { expected: Option<u64> },
+    UnexpectedLastSequences { expected: HashMap<u16, u64> },
     #[error(transparent)]
     Mongodb(#[from] mongodb::error::Error),
+    #[error(transparent)]
+    SerializeBson(#[from] bson::ser::Error),
 }
 
 impl<H> From<mongodb::error::Error> for EventHandlerError<MongoEventProcessorError, H> {

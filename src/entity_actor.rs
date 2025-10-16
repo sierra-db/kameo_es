@@ -1,11 +1,12 @@
 use std::{
+    borrow::Cow,
+    collections::{hash_map::Entry, HashMap, HashSet},
     fmt, io,
     ops::{ControlFlow, Deref},
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
 use chrono::{DateTime, Utc};
-use im::HashMap;
 use kameo::{
     actor::{ActorRef, WeakActorRef},
     error::{ActorStopReason, PanicError, SendError},
@@ -13,7 +14,7 @@ use kameo::{
     reply::DelegatedReply,
     Actor,
 };
-use kameo_es_core::EventType;
+use kameo_es_core::{CommandName, EventType};
 use redis::aio::MultiplexedConnection;
 use sierradb_client::{
     AsyncTypedCommands, CurrentVersion, EMAppendEvent, ErrorCode, ExpectedVersion, SierraError,
@@ -26,7 +27,7 @@ use crate::{
     command_service::{AppendedEvent, ExecuteResult},
     error::{parse_stream_version_string, ExecuteError, ParsedStream},
     transaction::{AbortTransaction, BeginTransaction, CommitTransaction, ResetTransaction},
-    Apply, CausationMetadata, Command, Entity, Metadata, StreamId,
+    Apply, Command, Entity, Metadata, StreamId,
 };
 
 pub struct EntityActor<E: Entity + Apply> {
@@ -51,8 +52,8 @@ pub struct EntityTransactionActor<E: Entity + Apply> {
 struct EntityActorState<E> {
     entity: E,
     version: CurrentVersion,
-    correlation_id: Uuid,
-    last_causations: HashMap<Uuid, CausationMetadata>,
+    causation_tracking: HashMap<StreamId, (u64, HashSet<Cow<'static, str>>)>,
+    command_history: Vec<Option<(Cow<'static, str>, SystemTime)>>,
 }
 
 impl<E> EntityActorState<E>
@@ -65,34 +66,44 @@ where
         stream_id: &StreamId,
         stream_version: u64,
         metadata: Metadata<E::Metadata>,
+        timestamp: SystemTime,
     ) {
         assert_eq!(
-            match self.version {
-                CurrentVersion::Current(version) => version + 1,
-                CurrentVersion::Empty => 0,
-            },
+            self.version.next(),
             stream_version,
             "expected stream version {} but got {stream_version} for stream {stream_id}",
-            match self.version {
-                CurrentVersion::Current(version) => version + 1,
-                CurrentVersion::Empty => 0,
-            },
+            self.version.next(),
         );
-        let causation = metadata.causation.clone();
-        if self.correlation_id.is_nil() {
-            assert_eq!(
-                self.version,
-                CurrentVersion::Empty,
-                "expected correlation id to be nil only if the stream doesn't exist"
-            );
-            self.correlation_id = metadata.correlation_id;
-        }
+        let causation_command = metadata.causation_command.clone();
+        let causation_event = metadata.causation_event.clone();
+
         self.entity.apply(event, metadata);
         self.version = CurrentVersion::Current(stream_version);
 
-        if let Some(causation) = causation {
-            self.last_causations
-                .insert(causation.correlation_id, causation);
+        self.command_history
+            .push(causation_command.clone().map(|cmd| (cmd, timestamp)));
+
+        if let Some((causation_command, causation_event)) = causation_command.zip(causation_event) {
+            match self.causation_tracking.entry(causation_event.stream_id) {
+                Entry::Occupied(mut entry) => {
+                    let (max_ver, commands) = entry.get_mut();
+                    if causation_event.stream_version > *max_ver {
+                        // New version - clear old commands and update
+                        *max_ver = causation_event.stream_version;
+                        commands.clear();
+                        commands.insert(causation_command);
+                    } else if causation_event.stream_version == *max_ver {
+                        // Same version - just add the command
+                        commands.insert(causation_command);
+                    }
+                    // Older versions are rejected earlier, so we don't handle them here
+                }
+                Entry::Vacant(entry) => {
+                    let mut commands = HashSet::new();
+                    commands.insert(causation_command);
+                    entry.insert((causation_event.stream_version, commands));
+                }
+            }
         }
     }
 
@@ -107,26 +118,45 @@ where
     ) -> Result<Option<Vec<E::Event>>, ExecuteError<E::Error>>
     where
         E: Command<C>,
+        C: CommandName,
     {
         if !expected_version.is_satisfied_by(self.version) {
             return Err(ExecuteError::IncorrectExpectedVersion {
-                stream_id: StreamId::new_from_parts(E::name(), id),
+                stream_id: StreamId::new_from_parts(E::category(), id),
                 current: self.version,
                 expected: expected_version,
             });
         }
 
+        if let Some(rate_limit) = self.entity.rate_limit() {
+            let now = SystemTime::now();
+            let window_start = now - rate_limit.window_duration;
+            let command_name = C::command_name();
+
+            // Count matching commands within the window
+            let count = self
+                .command_history
+                .iter()
+                .filter_map(|entry| entry.as_ref()) // Skip None entries
+                .filter(|(name, timestamp)| name == command_name && *timestamp > window_start)
+                .count();
+
+            if count >= rate_limit.max_requests as usize {
+                return Err(ExecuteError::RateLimitExceeded {
+                    max_requests: rate_limit.max_requests,
+                    window_duration: rate_limit.window_duration,
+                });
+            }
+        }
+
         let ctx = crate::Context {
-            metadata: &metadata,
-            last_causation: metadata
-                .causation
-                .as_ref()
-                .and_then(|causation| self.last_causations.get(&causation.correlation_id)),
+            metadata,
+            causation_tracking: &self.causation_tracking,
             time,
             executed_at,
         };
         let is_idempotent = self.entity.is_idempotent(&command, ctx);
-        if !is_idempotent {
+        if is_idempotent {
             return Ok(None);
         }
 
@@ -138,80 +168,56 @@ where
         Ok(Some(events))
     }
 
-    fn hydrate_metadata_correlation_id<F>(
-        &mut self,
-        metadata: &mut Metadata<E::Metadata>,
-    ) -> Result<(), ExecuteError<F>> {
-        match (
-            !self.correlation_id.is_nil(),
-            !metadata.correlation_id.is_nil(),
-        ) {
-            (true, true) => {
-                // Correlation ID exists, make sure they match
-                // TODO: Resolve
-                // if &self.correlation_id != &metadata.correlation_id {
-                //     return Err(ExecuteError::CorrelationIDMismatch {
-                //         entity: E::name(),
-                //         existing: self.correlation_id,
-                //         new: metadata.correlation_id,
-                //     });
-                // }
-            }
-            (true, false) => {
-                // Correlation ID exists, use the existing one
-                metadata.correlation_id = self.correlation_id;
-            }
-            (false, true) => {
-                // Correlation ID doesn't exist, make sure there's no current stream version
-                if &self.version != &CurrentVersion::Empty {
-                    return Err(ExecuteError::CorrelationIDNotSetOnExistingEntity);
-                }
-            }
-            (false, false) => {
-                // Correlation ID doesn't exist, and none defined
-                metadata.correlation_id = Uuid::new_v4();
-            }
-        }
-
-        Ok(())
-    }
-
     async fn resync_with_db(
         &mut self,
         conn: &mut MultiplexedConnection,
         stream_id: &StreamId,
         partition_key: Uuid,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), SierraError> {
         loop {
             let original_version = self.version;
-            let from_version = match self.version {
-                CurrentVersion::Current(version) => version + 1,
-                CurrentVersion::Empty => 0,
-            };
+            let from_version = self.version.next();
 
             let batch = conn
-                .escan_with_partition_key(&stream_id, partition_key, from_version, None, Some(100))
+                .escan_with_partition_key(stream_id, partition_key, from_version, None, Some(100))
                 .await?;
 
             for event in batch.events {
                 assert_eq!(
-                    match self.version {
-                        CurrentVersion::Current(version) => version + 1,
-                        CurrentVersion::Empty => 0,
-                    },
+                    self.version.next(),
                     event.stream_version,
                     "expected stream version {} but got {} for stream {}",
-                    match self.version {
-                        CurrentVersion::Current(version) => version + 1,
-                        CurrentVersion::Empty => 0,
-                    },
+                    self.version.next(),
                     event.stream_version,
                     event.stream_id,
                 );
-                let ent_event = ciborium::from_reader(event.payload.as_slice())?;
-                let metadata: Metadata<E::Metadata> =
-                    ciborium::from_reader(event.metadata.as_slice())?;
-                self.apply(ent_event, stream_id, event.stream_version, metadata);
+                let ent_event = ciborium::from_reader(event.payload.as_slice()).map_err(|err| {
+                    SierraError::Protocol {
+                        code: ErrorCode::ReadErr,
+                        message: Some(format!("failed to deserialize payload: {err}")),
+                    }
+                })?;
+                let metadata: Metadata<E::Metadata> = if event.metadata.is_empty() {
+                    Metadata {
+                        causation_command: None,
+                        causation_event: None,
+                        data: None,
+                    }
+                } else {
+                    ciborium::from_reader(event.metadata.as_slice()).map_err(|err| {
+                        SierraError::Protocol {
+                            code: ErrorCode::ReadErr,
+                            message: Some(format!("failed to deserialize metadata: {err}")),
+                        }
+                    })?
+                };
+                self.apply(
+                    ent_event,
+                    stream_id,
+                    event.stream_version,
+                    metadata,
+                    event.timestamp,
+                );
             }
 
             if !batch.has_more {
@@ -242,14 +248,14 @@ impl<E: Entity + Apply> EntityActor<E> {
             state: EntityActorState {
                 entity,
                 version: CurrentVersion::Empty,
-                correlation_id: Uuid::nil(),
-                last_causations: HashMap::new(),
+                causation_tracking: HashMap::new(),
+                command_history: Vec::new(),
             },
             conflict_reties: 5,
         }
     }
 
-    async fn resync_with_db(&mut self) -> anyhow::Result<()> {
+    async fn resync_with_db(&mut self) -> Result<(), SierraError> {
         self.state
             .resync_with_db(&mut self.conn, &self.stream_id, self.partition_key)
             .await
@@ -263,7 +269,9 @@ impl<E: Entity + Apply> EntityActor<E> {
     ) -> Result<Vec<AppendedEvent<E::Event>>, AppendEventsError<Vec<E::Event>, Metadata<E::Metadata>>>
     {
         let mut metadata_buf = Vec::new();
-        ciborium::into_writer(&metadata, &mut metadata_buf)?;
+        if !metadata.is_empty() {
+            ciborium::into_writer(&metadata, &mut metadata_buf)?;
+        }
 
         let expected_version = self.state.version.as_expected_version();
         let new_events = events
@@ -298,15 +306,17 @@ impl<E: Entity + Apply> EntityActor<E> {
             Err(err) => return Err(AppendEventsError::from_sierra_err(err, events, metadata)),
         };
 
-        let starting_version = match self.state.version {
-            CurrentVersion::Current(v) => v + 1,
-            CurrentVersion::Empty => 0,
-        };
+        let starting_version = self.state.version.next();
         let mut version = starting_version;
 
         for event in &events {
-            self.state
-                .apply(event.clone(), &self.stream_id, version, metadata.clone());
+            self.state.apply(
+                event.clone(),
+                &self.stream_id,
+                version,
+                metadata.clone(),
+                timestamp.into(),
+            );
             version += 1;
         }
 
@@ -316,6 +326,8 @@ impl<E: Entity + Apply> EntityActor<E> {
             .map(|(event, event_info)| AppendedEvent {
                 event,
                 event_id: event_info.event_id,
+                partition_id: event_info.partition_id,
+                partition_sequence: event_info.partition_sequence,
                 stream_version: event_info.stream_version,
                 timestamp: event_info.timestamp.into(),
             })
@@ -358,7 +370,13 @@ where
         _actor_ref: WeakActorRef<Self>,
         reason: ActorStopReason,
     ) -> Result<(), Self::Error> {
-        error!("entity actor stopped: {reason}");
+        match reason {
+            ActorStopReason::Normal => {}
+            ActorStopReason::LinkDied { .. } => {}
+            reason => {
+                error!("entity actor stopped: {reason}");
+            }
+        }
         Ok(())
     }
 }
@@ -372,6 +390,7 @@ pub struct Execute<I, C, M> {
     pub expected_version: ExpectedVersion,
     pub time: DateTime<Utc>,
     pub executed_at: Instant,
+    pub dry_run: bool,
 }
 
 impl<E, C> Message<Execute<E::ID, C, E::Metadata>> for EntityActor<E>
@@ -379,7 +398,7 @@ where
     E: Entity + Command<C> + Apply,
     E::ID: fmt::Debug,
     E::Metadata: fmt::Debug,
-    C: fmt::Debug + Clone + Send + 'static,
+    C: CommandName + fmt::Debug + Clone + Send + 'static,
 {
     type Reply = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
 
@@ -391,7 +410,7 @@ where
     ) -> Self::Reply {
         if exec.partition_key != self.partition_key {
             return Err(ExecuteError::PartitionKeyMismatch {
-                entity: E::name(),
+                entity: E::category(),
                 existing: self.partition_key,
                 new: exec.partition_key,
             });
@@ -399,13 +418,6 @@ where
 
         let mut attempt = 0;
         loop {
-            if let Err(err) = self
-                .state
-                .hydrate_metadata_correlation_id::<E::Error>(&mut exec.metadata)
-            {
-                return Err(err);
-            }
-
             let res = self.state.execute(
                 &exec.id,
                 exec.command.clone(),
@@ -418,6 +430,24 @@ where
                 Ok(Some(events)) => {
                     if events.is_empty() {
                         return Ok(ExecuteResult::Executed(vec![]));
+                    }
+
+                    if exec.dry_run {
+                        let starting_version = self.state.version.next();
+                        return Ok(ExecuteResult::Executed(
+                            events
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, event)| AppendedEvent {
+                                    event,
+                                    event_id: Uuid::new_v4(),
+                                    partition_id: 0,
+                                    partition_sequence: 0,
+                                    stream_version: starting_version + i as u64,
+                                    timestamp: exec.time,
+                                })
+                                .collect(),
+                        ));
                     }
 
                     // Append to event store directly
@@ -435,13 +465,19 @@ where
                                 return Err(ExecuteError::TooManyConflicts { stream_id });
                             }
 
+                            self.resync_with_db().await?;
+
                             attempt += 1;
                             exec.metadata = metadata;
                         }
                         Err(err) => return Err(err.into()),
                     }
                 }
-                Ok(None) => return Ok(ExecuteResult::Idempotent),
+                Ok(None) => {
+                    return Ok(ExecuteResult::Idempotent {
+                        current_version: self.state.version,
+                    })
+                }
                 Err(err) => return Err(err),
             }
         }
@@ -453,26 +489,23 @@ where
     E: Entity + Command<C> + Apply,
     E::ID: fmt::Debug,
     E::Metadata: fmt::Debug,
-    C: fmt::Debug + Clone + Send + 'static,
+    C: CommandName + fmt::Debug + Clone + Send + 'static,
 {
     type Reply = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
 
     #[instrument(name = "handle_execute", skip(self, ctx))]
     async fn handle(
         &mut self,
-        mut exec: Execute<E::ID, C, E::Metadata>,
+        exec: Execute<E::ID, C, E::Metadata>,
         ctx: &mut Context<Self, Self::Reply>,
     ) -> Self::Reply {
         if exec.partition_key != self.partition_key {
             return Err(ExecuteError::PartitionKeyMismatch {
-                entity: E::name(),
+                entity: E::category(),
                 existing: self.partition_key,
                 new: exec.partition_key,
             });
         }
-
-        self.state
-            .hydrate_metadata_correlation_id::<E::Error>(&mut exec.metadata)?;
 
         let res = self.state.execute(
             &exec.id,
@@ -486,14 +519,16 @@ where
             Some(events) => {
                 // Apply to temporary state
                 let starting_version = self.state.version;
-                let mut version = match self.state.version {
-                    CurrentVersion::Current(v) => v + 1,
-                    CurrentVersion::Empty => 0,
-                };
+                let mut version = self.state.version.next();
 
                 for event in events.clone() {
-                    self.state
-                        .apply(event, &self.stream_id, version, exec.metadata.clone());
+                    self.state.apply(
+                        event,
+                        &self.stream_id,
+                        version,
+                        exec.metadata.clone(),
+                        exec.time.into(),
+                    );
                     version += 1;
                 }
 
@@ -501,10 +536,11 @@ where
                     entity_actor_ref: ctx.actor_ref().clone(),
                     events,
                     expected_version: starting_version.as_expected_version(),
-                    correlation_id: exec.metadata.correlation_id,
                 })
             }
-            None => Ok(ExecuteResult::Idempotent),
+            None => Ok(ExecuteResult::Idempotent {
+                current_version: self.state.version,
+            }),
         }
     }
 }
@@ -639,7 +675,7 @@ impl<E, M> AppendEventsError<E, M> {
                     stream_id,
                     current,
                     expected,
-                } = parse_stream_version_string(&message).unwrap();
+                } = parse_stream_version_string(message.as_ref().unwrap()).unwrap();
                 AppendEventsError::IncorrectExpectedVersion {
                     partition_key,
                     stream_id,

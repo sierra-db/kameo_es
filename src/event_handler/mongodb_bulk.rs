@@ -1,9 +1,14 @@
 use std::{
+    collections::{BTreeMap, HashMap},
     mem,
+    num::ParseIntError,
+    str::FromStr,
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
+use bson::to_bson;
 use mongodb::{
     bson::doc,
     error::{ErrorKind, WriteError, WriteFailure},
@@ -14,17 +19,15 @@ use mongodb::{
     Client, ClientSession, Collection,
 };
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{error, info};
 
 use crate::Event;
 
-use super::{
-    mongodb::MongoEventProcessorError, CompositeEventHandler, EventHandler, EventHandlerError,
-    EventProcessor,
-};
+use super::{CompositeEventHandler, EventHandler, EventHandlerError, EventProcessor};
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Models {
     models: Vec<WriteModel>,
 }
@@ -64,6 +67,10 @@ impl Models {
         self.models.push(WriteModel::DeleteMany(model));
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+
     pub fn len(&self) -> usize {
         self.models.len()
     }
@@ -75,8 +82,8 @@ pub struct MongoDBBulkEventProcessor<H> {
     projection_id: String,
     handler: H,
     models: Models,
-    last_handled_event: Option<u64>,
-    last_flushed: Arc<Mutex<(Instant, Option<u64>)>>,
+    last_handled_sequences: HashMap<u16, u64>,
+    last_flushed: Arc<Mutex<(Instant, HashMap<u16, u64>)>>,
     flush_interval_time: Duration,
     flush_interval_models: usize,
     flush_interval_events: u64,
@@ -91,10 +98,21 @@ impl<H> MongoDBBulkEventProcessor<H> {
     ) -> anyhow::Result<Self> {
         let projection_id = projection_id.into();
 
-        let last_handled_event = checkpoints_collection
+        let last_handled_sequences: HashMap<u16, u64> = checkpoints_collection
             .find_one(doc! { "_id": &projection_id })
             .await?
-            .map(|checkpoint: Checkpoint| checkpoint.last_event_id as u64);
+            .map(|checkpoint: Checkpoint| {
+                checkpoint
+                    .sequences
+                    .into_iter()
+                    .map(|(partition_id, sequence)| {
+                        Ok::<_, ParseIntError>((u16::from_str(&partition_id)?, sequence))
+                    })
+                    .collect::<Result<_, _>>()
+            })
+            .transpose()
+            .context("failed to parse partition id in checkpoints collection")?
+            .unwrap_or_default();
 
         Ok(MongoDBBulkEventProcessor {
             client,
@@ -102,8 +120,8 @@ impl<H> MongoDBBulkEventProcessor<H> {
             projection_id,
             handler,
             models: Models::with_capacity(500),
-            last_handled_event,
-            last_flushed: Arc::new(Mutex::new((Instant::now(), last_handled_event))),
+            last_handled_sequences: last_handled_sequences.clone(),
+            last_flushed: Arc::new(Mutex::new((Instant::now(), last_handled_sequences))),
             flush_interval_time: Duration::from_secs(10),
             flush_interval_models: 100_000,
             flush_interval_events: 2_000,
@@ -133,30 +151,38 @@ impl<H> MongoDBBulkEventProcessor<H> {
         &mut self.handler
     }
 
-    pub fn last_handled_event(&self) -> Option<u64> {
-        self.last_handled_event
+    pub fn last_handled_sequences(&self) -> &HashMap<u16, u64> {
+        &self.last_handled_sequences
     }
 
     pub fn should_flush(&self) -> Option<FlushReason> {
+        // Flush if our models exceeds the models length flush interval models threshold
         if self.models.len() >= self.flush_interval_models {
             return Some(FlushReason::ModelsInterval);
         }
+
         let last_flushed = self.last_flushed.try_lock().ok()?;
-        if last_flushed.1 == self.last_handled_event {
-            return None;
-        }
-        let exceeded_flush_interval_events = match (last_flushed.1, self.last_handled_event) {
-            (_, None) => false,
-            (None, Some(last_handled_event)) => last_handled_event >= self.flush_interval_events,
-            (Some(last_flushed_event), Some(last_handled_event)) => {
-                last_handled_event - last_flushed_event >= self.flush_interval_events
-            }
-        };
-        if exceeded_flush_interval_events {
-            return Some(FlushReason::EventsInterval);
-        }
+
+        // Flush if we've exceeded the flush interval time
         if last_flushed.0.elapsed() >= self.flush_interval_time {
             return Some(FlushReason::TimeInterval);
+        }
+
+        // Flush if we've processed more events than the flush interval events threshold
+        let events_since_flush: u64 = self
+            .last_handled_sequences
+            .iter()
+            .map(|(partition_id, sequence)| {
+                last_flushed
+                    .1
+                    .get(partition_id)
+                    .map(|last_flushed_sequence| sequence - last_flushed_sequence)
+                    .unwrap_or(0)
+            })
+            .sum();
+        let exceeded_flush_interval_events = events_since_flush >= self.flush_interval_events;
+        if exceeded_flush_interval_events {
+            return Some(FlushReason::EventsInterval);
         }
 
         None
@@ -174,17 +200,19 @@ impl<H> MongoDBBulkEventProcessor<H> {
         &mut self,
         reason: FlushReason,
     ) -> Option<JoinHandle<Result<(), MongoEventProcessorError>>> {
-        let Some(last_handled_event) = self.last_handled_event else {
+        // If we haven't handled any sequences, we can skip flushing
+        if self.last_handled_sequences.is_empty() {
             return None;
-        };
+        }
 
-        info!("flushing at event {last_handled_event} because {reason:?}");
+        info!("flushing because {reason:?}");
 
         let mut last_flushed = self.last_flushed.clone().lock_owned().await;
         let client = self.client.clone();
         let checkpoints_collection = self.checkpoints_collection.clone();
         let projection_id = self.projection_id.clone();
         let models = mem::take(&mut self.models.models);
+        let last_handled_sequences = self.last_handled_sequences.clone();
 
         let handle = tokio::spawn(async move {
             let mut session = client.start_session().await?;
@@ -194,15 +222,19 @@ impl<H> MongoDBBulkEventProcessor<H> {
                 client,
                 checkpoints_collection,
                 &mut session,
-                last_flushed.1,
-                projection_id,
-                last_handled_event,
+                &last_flushed.1,
+                projection_id.clone(),
+                &last_handled_sequences,
                 models,
             )
             .await;
             match res {
                 Ok(()) => {
                     session.commit_transaction().await.unwrap();
+                    for (partition_id, sequence) in &last_handled_sequences {
+                        info!(gauge.projection_sequence = sequence, %projection_id, partition_id, database = "mongodb");
+                    }
+                    last_flushed.1 = last_handled_sequences;
                 }
                 Err(err) => {
                     let _ = session.abort_transaction().await;
@@ -212,7 +244,6 @@ impl<H> MongoDBBulkEventProcessor<H> {
             }
 
             last_flushed.0 = Instant::now();
-            last_flushed.1 = Some(last_handled_event);
 
             Ok(())
         });
@@ -224,52 +255,60 @@ impl<H> MongoDBBulkEventProcessor<H> {
         client: Client,
         checkpoints_collection: Collection<Checkpoint>,
         session: &mut ClientSession,
-        last_flushed_event: Option<u64>,
+        last_flushed_sequences: &HashMap<u16, u64>,
         projection_id: String,
-        last_handled_event: u64,
+        last_handled_sequences: &HashMap<u16, u64>,
         models: Vec<WriteModel>,
     ) -> Result<(), MongoEventProcessorError> {
-        match last_flushed_event {
-            Some(last_flushed_event) => {
-                let res = checkpoints_collection
-                    .update_one(
-                        doc! { "_id": projection_id, "last_event_id": last_flushed_event as i64 },
-                        doc! { "$set": { "last_event_id": last_handled_event as i64 } },
-                    )
-                    .session(&mut *session)
-                    .await?;
-                if res.matched_count == 0 {
-                    return Err(MongoEventProcessorError::UnexpectedLastEventId {
-                        expected: Some(last_flushed_event),
-                    });
-                }
-            }
-            None => {
-                let res = checkpoints_collection
-                    .insert_one(Checkpoint {
-                        id: projection_id,
-                        last_event_id: last_handled_event,
-                    })
-                    .session(&mut *session)
-                    .await;
-                match res {
-                    Ok(_) => {}
-                    Err(err) => match err.kind.as_ref() {
-                        ErrorKind::Write(WriteFailure::WriteError(WriteError { code, .. }))
-                            if *code == 11000 =>
-                        {
-                            return Err(MongoEventProcessorError::UnexpectedLastEventId {
-                                expected: None,
-                            });
-                        }
-                        _ => return Err(err.into()),
+        let last_flushed_sequences_bson: BTreeMap<_, _> = last_flushed_sequences
+            .iter()
+            .map(|(partition_id, sequence)| (partition_id.to_string(), *sequence))
+            .collect();
+        let last_handled_sequences_bson: BTreeMap<_, _> = last_handled_sequences
+            .iter()
+            .map(|(partition_id, sequence)| (partition_id.to_string(), *sequence))
+            .collect();
+
+        if !last_flushed_sequences.is_empty() {
+            let res = checkpoints_collection
+                .update_one(
+                    doc! {
+                        "_id": projection_id,
+                        "sequences": to_bson(&last_flushed_sequences_bson)?,
                     },
-                }
+                    doc! { "$set": { "sequences": to_bson(&last_handled_sequences_bson)? } },
+                )
+                .session(&mut *session)
+                .await?;
+            if res.matched_count == 0 {
+                return Err(MongoEventProcessorError::UnexpectedLastSequences {
+                    expected: last_flushed_sequences.clone(),
+                });
+            }
+        } else {
+            let res = checkpoints_collection
+                .insert_one(Checkpoint {
+                    id: projection_id,
+                    sequences: last_handled_sequences_bson,
+                })
+                .session(&mut *session)
+                .await;
+            match res {
+                Ok(_) => {}
+                Err(err) => match err.kind.as_ref() {
+                    ErrorKind::Write(WriteFailure::WriteError(WriteError { code, .. }))
+                        if *code == 11000 =>
+                    {
+                        return Err(MongoEventProcessorError::UnexpectedLastSequences {
+                            expected: HashMap::new(),
+                        });
+                    }
+                    _ => return Err(err.into()),
+                },
             }
         }
 
         if !models.is_empty() {
-            println!("writing {} models", models.len());
             client.bulk_write(models).session(&mut *session).await?;
         }
 
@@ -284,19 +323,28 @@ where
     type Context = Models;
     type Error = MongoEventProcessorError;
 
-    async fn start_from(&self) -> Result<u64, Self::Error> {
-        Ok(self.last_handled_event.map(|n| n + 1).unwrap_or(0))
+    async fn start_from(&self) -> Result<HashMap<u16, u64>, Self::Error> {
+        for (partition_id, sequence) in &self.last_handled_sequences {
+            info!(gauge.projection_sequence = sequence, projection_id = %self.projection_id, partition_id, database = "mongodb");
+        }
+
+        Ok(self
+            .last_handled_sequences
+            .iter()
+            .map(|(partition_id, sequence)| (*partition_id, sequence + 1))
+            .collect())
     }
 
     async fn process_event(
         &mut self,
         event: Event,
     ) -> Result<(), EventHandlerError<Self::Error, <H as EventHandler<Self::Context>>::Error>> {
-        let event_id = event.id;
+        let partition_id = event.partition_id;
+        let partition_sequence = event.partition_sequence;
         self.handler
             .composite_handle(&mut self.models, event)
             .await?;
-        self.last_handled_event = Some(event_id);
+        *self.last_handled_sequences.entry(partition_id).or_default() = partition_sequence;
         self.flush().await;
 
         Ok(())
@@ -307,7 +355,7 @@ where
 pub struct Checkpoint {
     #[serde(rename = "_id")]
     pub id: String,
-    pub last_event_id: u64,
+    pub sequences: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -320,4 +368,14 @@ pub enum FlushReason {
 
 pub trait FlushHandler {
     fn flush(&mut self);
+}
+
+#[derive(Debug, Error)]
+pub enum MongoEventProcessorError {
+    #[error("unexpected last event id, expected {expected:?}")]
+    UnexpectedLastSequences { expected: HashMap<u16, u64> },
+    #[error(transparent)]
+    Mongodb(#[from] mongodb::error::Error),
+    #[error(transparent)]
+    SerializeBson(#[from] bson::ser::Error),
 }

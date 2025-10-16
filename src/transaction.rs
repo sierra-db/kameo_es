@@ -13,14 +13,16 @@ use uuid::Uuid;
 
 use crate::{command_service::CommandService, entity_actor::EntityTransactionActor, StreamId};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionOutcome<C = (), A = ()> {
     Commit(C),
     Abort(A),
 }
 
+#[must_use]
 pub struct Transaction<'a> {
     pub(crate) cmd_service: &'a CommandService,
-    pub(crate) partition_key: Uuid,
+    pub(crate) partition_key: &'a mut Option<Uuid>,
     entities: &'a mut HashMap<StreamId, Box<dyn EntityTransaction>>,
     appends: &'a mut Vec<EMAppendEvent<'static>>,
 }
@@ -28,7 +30,7 @@ pub struct Transaction<'a> {
 impl<'a> Transaction<'a> {
     pub(crate) fn new(
         cmd_service: &'a CommandService,
-        partition_key: Uuid,
+        partition_key: &'a mut Option<Uuid>,
         entities: &'a mut HashMap<StreamId, Box<dyn EntityTransaction>>,
         appends: &'a mut Vec<EMAppendEvent<'static>>,
     ) -> Self {
@@ -66,13 +68,13 @@ impl<'a> Transaction<'a> {
     }
 
     pub(crate) fn committed(self) {
-        for (_, entity) in self.entities {
+        for entity in self.entities.values_mut() {
             let _ = entity.commit_transaction();
         }
     }
 
     pub(crate) fn reset(self) {
-        for (_, entity) in &*self.entities {
+        for entity in self.entities.values() {
             let _ = entity.reset_transaction();
         }
         // self.entities.clear();
@@ -80,7 +82,7 @@ impl<'a> Transaction<'a> {
     }
 
     pub(crate) fn abort(self) {
-        for (_, entity) in self.entities {
+        for entity in self.entities.values_mut() {
             let _ = entity.abort_transaction();
         }
     }
