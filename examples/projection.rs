@@ -6,20 +6,19 @@ use kameo_es::{
         in_memory::InMemoryEventProcessor, EntityEventHandler, EventHandler,
         EventHandlerStreamBuilder,
     },
-    Apply, Command, CommandName, Entity, Event, EventType, Metadata,
+    Apply, Command, CommandName, Context, Entity, Event, EventType, Metadata,
 };
-use redis::Value;
 use serde::{Deserialize, Serialize};
 use sierradb_client::SierraAsyncClientExt;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let client = redis::Client::open("redis://127.0.0.1:9090?protocol=resp3")?;
-    let mut conn = client.get_multiplexed_tokio_connection().await?;
+    let conn = client.get_multiplexed_tokio_connection().await?;
     let cmd_service = CommandService::new(conn.clone());
     let mut subscriptions = client.subscription_manager().await?;
 
-    MyEntity::execute(&cmd_service, "abc".to_string(), MyEntityEvent::Foo {}).await?;
+    MyEntity::execute(&cmd_service, "abc".to_string(), AppendFoo).await?;
 
     let mut processor = InMemoryEventProcessor::new(EventKindCounter::default());
 
@@ -45,37 +44,29 @@ impl Entity for MyEntity {
     }
 }
 
-#[derive(Clone, Debug, CommandName, Serialize, Deserialize)]
+#[derive(Clone, Debug, EventType, Serialize, Deserialize)]
 pub enum MyEntityEvent {
     Foo {},
     Bar {},
     Baz {},
 }
 
-impl EventType for MyEntityEvent {
-    fn event_type(&self) -> &'static str {
-        match self {
-            MyEntityEvent::Foo {} => "Foo",
-            MyEntityEvent::Bar {} => "Bar",
-            MyEntityEvent::Baz {} => "Baz",
-        }
-    }
-}
-
 impl Apply for MyEntity {
     fn apply(&mut self, _event: Self::Event, _metadata: Metadata<Self::Metadata>) {}
 }
 
-impl Command<MyEntityEvent> for MyEntity {
+#[derive(Clone, Debug, CommandName)]
+struct AppendFoo;
+
+impl Command<AppendFoo> for MyEntity {
     type Error = String;
 
     fn handle(
         &self,
-        cmd: MyEntityEvent,
-        _ctx: kameo_es::Context<'_, Self>,
+        _cmd: AppendFoo,
+        _ctx: Context<'_, Self>,
     ) -> Result<Vec<Self::Event>, Self::Error> {
-        println!("runnning");
-        Ok(vec![cmd])
+        Ok(vec![MyEntityEvent::Foo {}])
     }
 }
 
