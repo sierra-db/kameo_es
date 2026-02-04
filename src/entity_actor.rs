@@ -173,7 +173,7 @@ where
             let from_version = self.version.next();
 
             let batch = conn
-                .escan_with_partition_key(stream_id, partition_key, from_version, None, Some(100))
+                .escan_with_partition_key(stream_id, partition_key, from_version, None, Some(50000))
                 .await?;
 
             for event in batch.events {
