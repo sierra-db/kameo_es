@@ -418,7 +418,7 @@ where
 {
     type Reply = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
 
-    #[instrument(name = "handle_execute", skip(self, _ctx))]
+    #[instrument(name = "handle_execute", skip_all)]
     async fn handle(
         &mut self,
         mut exec: Execute<E::ID, C, E::Metadata>,
@@ -509,7 +509,7 @@ where
 {
     type Reply = Result<ExecuteResult<E>, ExecuteError<E::Error>>;
 
-    #[instrument(name = "handle_execute", skip(self, ctx))]
+    #[instrument(name = "handle_execute", skip_all)]
     async fn handle(
         &mut self,
         exec: Execute<E::ID, C, E::Metadata>,
