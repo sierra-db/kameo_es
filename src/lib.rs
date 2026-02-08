@@ -1,8 +1,11 @@
 pub mod command_service;
+pub mod connection_pool;
 pub mod entity_actor;
 pub mod error;
 pub mod event_handler;
 pub mod transaction;
+
+pub use connection_pool::ConnectionPool;
 
 use std::{convert::Infallible, io};
 

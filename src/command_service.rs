@@ -18,34 +18,53 @@ use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::{
+    connection_pool::ConnectionPool,
     entity_actor::{self, EntityActor, EntityTransactionActor},
     error::{parse_stream_version_string, ExecuteError, ParsedStream},
     transaction::{self, Transaction, TransactionOutcome},
     Apply, Command, Entity, Event, EventCausation, EventType, Metadata, StreamId,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CommandService {
     actor_ref: ActorRef<CommandServiceActor>,
-    conn: MultiplexedConnection,
+    pool: ConnectionPool,
+}
+
+impl std::fmt::Debug for CommandService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandService")
+            .field("actor_ref", &self.actor_ref)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CommandService {
-    /// Creates a new command service using an event store client connection and default worker count.
+    /// Creates a new command service using a single event store client connection.
+    ///
+    /// For higher throughput, consider using [`new_with_pool`](Self::new_with_pool) instead.
     #[inline]
     pub fn new(conn: MultiplexedConnection) -> Self {
+        Self::new_with_pool(ConnectionPool::from(conn))
+    }
+
+    /// Creates a new command service using a connection pool.
+    ///
+    /// This allows distributing load across multiple connections for higher throughput.
+    #[inline]
+    pub fn new_with_pool(pool: ConnectionPool) -> Self {
         let actor_ref = CommandServiceActor::spawn(CommandServiceActor {
-            conn: conn.clone(),
+            pool: pool.clone(),
             entities: LruCache::new(NonZeroUsize::new(20_000).unwrap()),
         });
 
-        CommandService { actor_ref, conn }
+        CommandService { actor_ref, pool }
     }
 
-    /// Returns a reference to the inner event store.
+    /// Returns a connection from the pool.
     #[inline]
-    pub fn conn(&mut self) -> &mut MultiplexedConnection {
-        &mut self.conn
+    pub fn conn(&self) -> MultiplexedConnection {
+        self.pool.get()
     }
 
     /// Starts a transaction.
@@ -73,8 +92,8 @@ impl CommandService {
                     let current_appends = mem::take(&mut appends);
 
                     // Attempt the transaction
-                    match self
-                        .conn
+                    let mut conn = self.pool.get();
+                    match conn
                         .emappend(final_partition_key, &current_appends)
                         .await
                     {
@@ -144,7 +163,7 @@ impl CommandService {
 
 /// The command service routes commands to spawned entity actors per stream id.
 struct CommandServiceActor {
-    conn: MultiplexedConnection,
+    pool: ConnectionPool,
     entities: LruCache<StreamId, (ActorId, Box<dyn any::Any + Send + Sync + 'static>)>,
 }
 
@@ -614,7 +633,7 @@ impl CommandServiceActor {
                 let entity_ref = EntityActor::spawn_link(
                     cmd_service_actor_ref,
                     EntityActor::new(
-                        self.conn.clone(),
+                        self.pool.get(),
                         partition_key,
                         stream_id.clone(),
                         E::default(),
