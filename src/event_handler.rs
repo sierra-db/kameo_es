@@ -57,6 +57,10 @@ pub trait EventHandler<C>: Send {
     fn flush(&mut self, _ctx: &mut C) -> impl Future<Output = Result<(), Self::Error>> + Send {
         async move { Ok(()) }
     }
+
+    fn after_commit(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async move { Ok(()) }
+    }
 }
 
 /// An event handler for an entity.

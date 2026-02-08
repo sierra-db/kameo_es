@@ -547,6 +547,11 @@ where
             .await
             .map_err(|err| EventHandlerError::Processor(err.into()))?;
 
+        self.handler
+            .after_commit()
+            .await
+            .map_err(EventHandlerError::Handler)?;
+
         self.last_flushed_sequences = self.last_handled_sequences.clone();
         self.events_since_flush = 0;
         self.last_flushed = Instant::now();
