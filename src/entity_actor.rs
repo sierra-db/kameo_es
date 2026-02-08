@@ -268,6 +268,9 @@ impl<E: Entity + Apply> EntityActor<E> {
         timestamp: DateTime<Utc>,
     ) -> Result<Vec<AppendedEvent<E::Event>>, AppendEventsError<Vec<E::Event>, Metadata<E::Metadata>>>
     {
+        let total_start = Instant::now();
+
+        let serialize_start = Instant::now();
         let mut metadata_buf = Vec::new();
         if !metadata.is_empty() {
             ciborium::into_writer(&metadata, &mut metadata_buf)?;
@@ -300,12 +303,22 @@ impl<E: Entity + Apply> EntityActor<E> {
                 )
             })
             .collect::<Result<Vec<_>, AppendEventsError<_, _>>>()?;
+        tracing::info!(
+            histogram.append_serialize_duration = serialize_start.elapsed().as_secs_f64(),
+            events = new_events.len(),
+        );
 
+        let emappend_start = Instant::now();
         let info = match self.conn.emappend(self.partition_key, &new_events).await {
             Ok(info) => info,
             Err(err) => return Err(AppendEventsError::from_sierra_err(err, events, metadata)),
         };
+        tracing::info!(
+            histogram.append_emappend_duration = emappend_start.elapsed().as_secs_f64(),
+            events = new_events.len(),
+        );
 
+        let apply_start = Instant::now();
         let starting_version = self.state.version.next();
         let mut version = starting_version;
 
@@ -332,6 +345,9 @@ impl<E: Entity + Apply> EntityActor<E> {
                 timestamp: event_info.timestamp.into(),
             })
             .collect();
+        tracing::info!(histogram.append_apply_duration = apply_start.elapsed().as_secs_f64(),);
+
+        tracing::info!(histogram.append_events_total = total_start.elapsed().as_secs_f64(),);
 
         Ok(appended)
     }
