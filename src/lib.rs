@@ -94,7 +94,7 @@ macro_rules! match_event {
             if category == <$ent as $crate::Entity>::category() {
                 let $event = $event.as_entity::<$ent>();
                 {
-                    let _res = $handle;
+                    $handle
                 }
             } else
         )*
