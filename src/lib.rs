@@ -100,6 +100,8 @@ macro_rules! match_event {
         )*
         if true {
             $else
+        } else {
+            unreachable!()
         }
     }};
 
