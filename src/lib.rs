@@ -91,7 +91,7 @@ macro_rules! match_event {
     }) => {{
         let category = $event.stream_id.category();
         $(
-            if category == $ent::category() {
+            if category == <$ent as $crate::Entity>::category() {
                 let $event = $event.as_entity::<$ent>();
                 {
                     let _res = $handle;
